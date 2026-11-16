@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Çevrimdışı</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f8f9fa; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .kutu { text-align: center; padding: 2rem; }
+        .ikon { font-size: 4rem; margin-bottom: 1rem; }
+        h1 { color: #212529; font-size: 1.5rem; }
+        p { color: #6c757d; }
+        button { background: #0d6efd; color: #fff; border: 0; border-radius: .375rem; padding: .6rem 1.5rem; font-size: 1rem; cursor: pointer; }
+        button:hover { background: #0b5ed7; }
+    </style>
+</head>
+<body>
+    <div class="kutu">
+        <div class="ikon">📡</div>
+        <h1>İnternet bağlantısı yok</h1>
+        <p>Bağlantınızı kontrol edip tekrar deneyin.<br>Kuyruğa alınan kayıtlar bağlantı gelince otomatik gönderilir.</p>
+        <button onclick="location.reload()">Tekrar Dene</button>
+    </div>
+</body>
+</html>
