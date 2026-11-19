@@ -102,6 +102,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(BelgeServis::onayKaydet($db, $firmaScopeIds, $permissions, $user['kullanici_id'], $_POST));
                 break;
 
+            case 'toplu_onay_kaydet':
+                echo json_encode(BelgeServis::topluOnayKaydet($db, $firmaScopeIds, $permissions, $user['kullanici_id'], $_POST));
+                break;
+
             case 'delete':
                 echo json_encode(BelgeServis::sil($db, $firmaScopeIds, $permissions, $_POST['firma_belge_id'] ?? 0));
                 break;
@@ -292,9 +296,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
                         </div>
                         <div class="card-body">
+                            <?php if ($permissions['can_edit']): ?>
+                            <div id="topluIslemCubugu" class="alert alert-info d-none py-2">
+                                <div class="d-flex flex-wrap align-items-center gap-2">
+                                <i class="bi bi-check2-square"></i>
+                                <span><strong id="seciliSayi">0</strong> belge seçildi</span>
+                                <button type="button" class="btn btn-primary btn-sm ms-auto" onclick="topluOnayAc()">
+                                    <i class="bi bi-clipboard-check"></i> Toplu Onay Durumu
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary btn-sm" onclick="secimiTemizle()">
+                                    <i class="bi bi-x-lg"></i> Seçimi Temizle
+                                </button>
+                                </div>
+                            </div>
+                            <?php endif; ?>
                             <table id="belgeTable" class="table table-bordered table-striped table-hover">
                                 <thead>
                                     <tr>
+                                        <th class="text-center" style="width: 40px;">
+                                            <?php if ($permissions['can_edit']): ?>
+                                            <div class="form-check form-switch d-flex justify-content-center">
+                                                <input class="form-check-input" type="checkbox" role="switch" id="tumunuSec" title="Filtrelenen tüm belgeleri seç">
+                                                <label class="form-check-label" for="tumunuSec"></label>
+                                            </div>
+                                            <?php endif; ?>
+                                        </th>
                                         <th>Firma</th>
                                         <th>Belge Tipi</th>
                                         <th>Belge</th>
@@ -375,8 +401,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
 
                             <div class="col-md-12">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="firma_belge_durum" name="firma_belge_durum" checked>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="firma_belge_durum" name="firma_belge_durum" value="1" checked>
                                     <label class="form-check-label" for="firma_belge_durum">Aktif</label>
                                 </div>
                             </div>
@@ -406,6 +432,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <form id="onayForm">
                     <div class="modal-body">
                         <input type="hidden" id="onay_firma_belge_id" name="firma_belge_id" value="">
+                        <div id="topluOnayBilgi" class="alert alert-warning py-2 d-none">
+                            <i class="bi bi-info-circle"></i> Seçili <strong id="topluOnaySayi">0</strong> belgenin onay durumu ve açıklaması birlikte güncellenecek.
+                        </div>
 
                         <div class="mb-3">
                             <label for="firma_belge_onay_durumu_id" class="form-label">Durum <span class="text-danger">*</span></label>
@@ -446,6 +475,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         let dataTable;
         let belgeTipleri = [];
         let onayDurumlari = [];
+        const seciliBelgeler = new Set(); // Sayfalar arası korunan seçim
+        let topluOnayModu = false;
 
         const permissions = {
             canAdd: <?= $permissions['can_add'] ? 'true' : 'false' ?>,
@@ -503,10 +534,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             dataTable = $('#belgeTable').DataTable({
                 language: { url: '//cdn.datatables.net/plug-ins/1.13.6/i18n/tr.json' },
-                order: [[6, 'desc']],
-                columnDefs: [{ orderable: false, targets: [2, 8] }],
+                order: [[7, 'desc']],
+                columnDefs: [
+                    { orderable: false, searchable: false, className: 'text-center', targets: 0, visible: permissions.canEdit },
+                    { orderable: false, targets: [3, 9] }
+                ],
                 pageLength: 25,
                 lengthMenu: [[10, 25, 50, 100, -1], [10, 25, 50, 100, "Tümü"]]
+            });
+
+            // Satır seçimi
+            $('#belgeTable tbody').on('change', '.belge-sec', function() {
+                const id = parseInt(this.value, 10);
+                this.checked ? seciliBelgeler.add(id) : seciliBelgeler.delete(id);
+                secimGuncelle();
+            });
+
+            // Tümünü seç: filtre/aramadan geçen tüm satırlar (tüm sayfalar)
+            $('#tumunuSec').on('change', function() {
+                const secili = this.checked;
+                $(dataTable.rows({ search: 'applied' }).nodes()).find('.belge-sec').each(function() {
+                    this.checked = secili;
+                    const id = parseInt(this.value, 10);
+                    secili ? seciliBelgeler.add(id) : seciliBelgeler.delete(id);
+                });
+                secimGuncelle();
+            });
+
+            dataTable.on('draw.dt', function() {
+                tumunuSecDurumu();
+            });
+
+            // Modal kapanınca tekil moda dön
+            document.getElementById('onayModal').addEventListener('hidden.bs.modal', function() {
+                topluOnayModu = false;
+                $('#topluOnayBilgi').addClass('d-none');
+                $('#onayModalLabel').text('Onay Durumu');
             });
 
             $('.select2-filter').select2({
@@ -618,8 +681,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (tip.belge_tipi_gecerlilik_ay) bilgi.push(tip.belge_tipi_gecerlilik_ay + ' ay geçerli');
             $('#belge_tipi_bilgi').text(bilgi.join(' • '));
 
+            // Dosya gerektirmeyen tipte yıldız gizlenir; düzenlemede zaten gizli
+            const dosyaGerekli = tip.belge_tipi_dosya_zorunlu != 0;
+            $('#dosya_zorunlu').toggleClass('d-none', !dosyaGerekli || duzenleme);
+
             $('#dosya_yardim').text(
-                'İzinli formatlar: ' + formatlar.join(', ').toUpperCase() +
+                (dosyaGerekli ? '' : 'Bu belge tipinde dosya isteğe bağlıdır • ') +
+                'İzinli formatlar: ' + (formatlar.length ? formatlar.join(', ').toUpperCase() : 'Tüm tanımlı formatlar') +
                 ' • Maksimum ' + tip.belge_tipi_max_boyut_mb + ' MB' +
                 (coklu ? ' • Birden fazla dosya seçebilirsiniz' : '') +
                 (coklu && duzenleme ? ' (ilk dosya mevcut dosyanın yerine geçer, diğerleri yeni belge olarak eklenir)' : '')
@@ -737,17 +805,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         function renderBelgeTable(belgeler) {
             dataTable.clear();
 
+            // Listede artık olmayan belgeler seçimden çıkarılır
+            const listedekiIdler = new Set(belgeler.map(b => parseInt(b.firma_belge_id, 10)));
+            [...seciliBelgeler].forEach(id => { if (!listedekiIdler.has(id)) seciliBelgeler.delete(id); });
+
             belgeler.forEach(b => {
+                const belgeId = parseInt(b.firma_belge_id, 10);
+                const secimHucre = permissions.canEdit ? `
+                    <div class="form-check form-switch d-flex justify-content-center">
+                        <input class="form-check-input belge-sec" type="checkbox" role="switch" id="sec_${belgeId}" value="${belgeId}" ${seciliBelgeler.has(belgeId) ? 'checked' : ''}>
+                        <label class="form-check-label" for="sec_${belgeId}"></label>
+                    </div>` : '';
+
                 const ikon = b.belge_tipi_ikon
                     ? `<i class="${escapeHtml(b.belge_tipi_ikon)} me-1"></i>`
                     : '<i class="bi bi-file-earmark me-1"></i>';
 
-                const baslik = b.firma_belge_baslik || b.firma_belge_dosya_adi;
+                const dosyaVar = !!b.firma_belge_dosya_adi;
+                const baslik = b.firma_belge_baslik || b.firma_belge_dosya_adi || b.belge_tipi_adi;
                 const belgeHucre = `
                     <div><strong>${escapeHtml(baslik)}</strong></div>
                     <small class="text-muted dosya-adi">
-                        <span class="badge text-bg-secondary">${escapeHtml((b.firma_belge_dosya_uzanti || '').toUpperCase())}</span>
-                        ${escapeHtml(b.firma_belge_dosya_adi)} · ${formatBoyut(b.firma_belge_dosya_boyut)}
+                        ${dosyaVar
+                            ? `<span class="badge text-bg-secondary">${escapeHtml((b.firma_belge_dosya_uzanti || '').toUpperCase())}</span>
+                               ${escapeHtml(b.firma_belge_dosya_adi)} · ${formatBoyut(b.firma_belge_dosya_boyut)}`
+                            : '<span class="badge text-bg-light border"><i class="bi bi-file-earmark-x"></i> Dosya yok</span>'}
                     </small>
                 `;
 
@@ -785,14 +867,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? '<span class="status-badge status-active">Aktif</span>'
                     : '<span class="status-badge status-inactive">Pasif</span>';
 
-                let islemler = `
+                let islemler = dosyaVar ? `
                     <a class="btn btn-sm btn-info" href="/admin/belge-indir.php?id=${b.firma_belge_id}&onizle=1" target="_blank" title="Önizle">
                         <i class="bi bi-eye"></i>
                     </a>
                     <a class="btn btn-sm btn-success" href="/admin/belge-indir.php?id=${b.firma_belge_id}" title="İndir">
                         <i class="bi bi-download"></i>
                     </a>
-                `;
+                ` : '';
                 if (permissions.canEdit) {
                     islemler += `
                         <button class="btn btn-sm btn-primary" onclick="onayAc(${b.firma_belge_id}, ${b.firma_belge_onay_durumu_id})" title="Onay Durumu">
@@ -812,6 +894,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 dataTable.row.add([
+                    secimHucre,
                     escapeHtml(b.firma_adi),
                     ikon + escapeHtml(b.belge_tipi_adi),
                     belgeHucre,
@@ -825,6 +908,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             });
 
             dataTable.draw();
+            secimGuncelle();
+        }
+
+        function secimGuncelle() {
+            const sayi = seciliBelgeler.size;
+            $('#seciliSayi').text(sayi);
+            $('#topluIslemCubugu').toggleClass('d-none', sayi === 0);
+            tumunuSecDurumu();
+        }
+
+        // Başlık anahtarı: filtrelenen satırların hepsi seçiliyse açık
+        function tumunuSecDurumu() {
+            const el = document.getElementById('tumunuSec');
+            if (!el) return;
+            const kutular = $(dataTable.rows({ search: 'applied' }).nodes()).find('.belge-sec');
+            const seciliOlan = kutular.filter(':checked').length;
+            el.checked = kutular.length > 0 && seciliOlan === kutular.length;
+            el.indeterminate = seciliOlan > 0 && seciliOlan < kutular.length;
+        }
+
+        function secimiTemizle() {
+            seciliBelgeler.clear();
+            $(dataTable.rows().nodes()).find('.belge-sec').prop('checked', false);
+            secimGuncelle();
+        }
+
+        function topluOnayAc() {
+            if (seciliBelgeler.size === 0) {
+                showToast('Önce belge seçin', 'warning');
+                return;
+            }
+            topluOnayModu = true;
+            document.getElementById('onay_firma_belge_id').value = '';
+            document.getElementById('firma_belge_onay_aciklama').value = '';
+            $('#firma_belge_onay_durumu_id').val(null).trigger('change.select2');
+            $('#topluOnaySayi').text(seciliBelgeler.size);
+            $('#topluOnayBilgi').removeClass('d-none');
+            $('#onayModalLabel').text(`Toplu Onay Durumu (${seciliBelgeler.size} belge)`);
+            onayModal.show();
         }
 
         function resetForm() {
@@ -900,7 +1022,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $('#belge_tipi_id').val(b.belge_tipi_id).trigger('change.select2');
                         belgeTipiBilgisiGoster(b.belge_tipi_id);
 
-                        $('#mevcut_dosya_adi').text(b.firma_belge_dosya_adi || '-');
+                        $('#mevcut_dosya_adi').text(b.firma_belge_dosya_adi || 'Dosya yok');
                         $('#mevcut_dosya').removeClass('d-none');
                         $('#dosya_zorunlu').addClass('d-none');
 
@@ -925,7 +1047,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         function saveOnay() {
             const formData = new FormData(document.getElementById('onayForm'));
-            formData.append('action', 'onay_kaydet');
+            const toplu = topluOnayModu;
+
+            if (toplu) {
+                formData.delete('firma_belge_id');
+                formData.append('action', 'toplu_onay_kaydet');
+                seciliBelgeler.forEach(id => formData.append('firma_belge_ids[]', id));
+            } else {
+                formData.append('action', 'onay_kaydet');
+            }
+
+            const $btn = $('#onayForm button[type="submit"]');
+            $btn.prop('disabled', true);
 
             $.ajax({
                 url: '',
@@ -938,6 +1071,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (data.success) {
                         showToast(data.message, 'success');
                         onayModal.hide();
+                        if (toplu) seciliBelgeler.clear();
                         loadBelgeList();
                         loadStats();
                     } else {
@@ -946,6 +1080,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 },
                 error: function() {
                     showToast('İşlem sırasında hata oluştu', 'error');
+                },
+                complete: function() {
+                    $btn.prop('disabled', false);
                 }
             });
         }

@@ -26,25 +26,18 @@ class BelgeServis {
      * Firmalar tablosunun "f" takma adıyla kullanıldığı sorgulara eklenir.
      */
     public static function firmaOzetSql() {
+        // belge_onay_ozet: aktif belgelerin onay durumuna göre adetleri (JSON, tanim_BelgeOnayDurumlari sırasıyla)
         return "
             (SELECT count(*) FROM dbo.Firma_Belgeleri fbs
                 WHERE fbs.firma_id = f.firma_id AND fbs.firma_belge_durum = 1) as belge_sayisi,
-            (SELECT count(*) FROM dbo.tanim_BelgeTipleri bts
-                WHERE bts.belge_tipi_durum = 1 AND bts.belge_tipi_zorunlu = 1
-                  AND NOT EXISTS (
-                        SELECT 1 FROM dbo.Firma_Belgeleri fbe
-                        WHERE fbe.firma_id = f.firma_id
-                          AND fbe.belge_tipi_id = bts.belge_tipi_id
-                          AND fbe.firma_belge_durum = 1
-                  )) as eksik_zorunlu_belge,
-            (SELECT count(*) FROM dbo.Firma_Belgeleri fbd
-                WHERE fbd.firma_id = f.firma_id AND fbd.firma_belge_durum = 1
-                  AND fbd.firma_belge_gecerlilik_bitis IS NOT NULL
-                  AND fbd.firma_belge_gecerlilik_bitis <= DATEADD(day, 30, CAST(GETDATE() AS DATE))) as suresi_dolan_belge,
-            (SELECT count(*) FROM dbo.Firma_Belgeleri fbb
-                INNER JOIN dbo.tanim_BelgeOnayDurumlari odb ON fbb.firma_belge_onay_durumu_id = odb.onay_durumu_id
-                WHERE fbb.firma_id = f.firma_id AND fbb.firma_belge_durum = 1
-                  AND odb.onay_durumu_kod = 'BEKLEMEDE') as bekleyen_belge
+            (SELECT od.onay_durumu_id AS id, od.onay_durumu_adi AS adi, od.onay_durumu_renk AS renk,
+                    od.onay_durumu_ikon AS ikon, COUNT(*) AS adet
+                FROM dbo.Firma_Belgeleri fbo
+                INNER JOIN dbo.tanim_BelgeOnayDurumlari od ON fbo.firma_belge_onay_durumu_id = od.onay_durumu_id
+                WHERE fbo.firma_id = f.firma_id AND fbo.firma_belge_durum = 1
+                GROUP BY od.onay_durumu_id, od.onay_durumu_adi, od.onay_durumu_renk, od.onay_durumu_ikon, od.onay_durumu_sira_no
+                ORDER BY od.onay_durumu_sira_no
+                FOR JSON PATH) as belge_onay_ozet
         ";
     }
 
@@ -204,6 +197,7 @@ class BelgeServis {
                 belge_tipi_kod,
                 belge_tipi_zorunlu,
                 belge_tipi_coklu_yukleme,
+                belge_tipi_dosya_zorunlu,
                 belge_tipi_gecerlilik_ay,
                 belge_tipi_izinli_formatlar,
                 belge_tipi_max_boyut_mb
@@ -312,7 +306,9 @@ class BelgeServis {
         $dosyalar = self::dosyaListesi($files['belge_dosya'] ?? null);
         $dosyaGeldi = count($dosyalar) > 0;
 
-        if ($belgeId == 0 && !$dosyaGeldi) {
+        $dosyaZorunlu = (int)($belgeTipi['belge_tipi_dosya_zorunlu'] ?? 1) === 1;
+
+        if ($belgeId == 0 && !$dosyaGeldi && $dosyaZorunlu) {
             return ['success' => false, 'message' => 'Yüklenecek dosyayı seçin!'];
         }
 
@@ -408,6 +404,18 @@ class BelgeServis {
 
         // Düzenlemede ilk dosya mevcut kaydın yerine geçer, kalanlar yeni belge olur
         $yeniKayitDosyalari = $belgeId > 0 ? array_slice($kaydedilenler, 1) : $kaydedilenler;
+
+        // Dosya gerektirmeyen tipte dosyasız tek kayıt açılır
+        if ($belgeId == 0 && !$kaydedilenler) {
+            $yeniKayitDosyalari = [[
+                'firma_belge_dosya_adi'    => null,
+                'firma_belge_dosya_yolu'   => null,
+                'firma_belge_dosya_uzanti' => null,
+                'firma_belge_dosya_mime'   => null,
+                'firma_belge_dosya_boyut'  => 0,
+                'firma_belge_dosya_hash'   => null,
+            ]];
+        }
 
         $varsayilan = $db->fetchOne("
             SELECT TOP 1 onay_durumu_id
@@ -533,7 +541,8 @@ class BelgeServis {
         $uzanti = strtolower(pathinfo($dosya['name'], PATHINFO_EXTENSION));
 
         $izinliler = array_filter(array_map('trim', explode(',', strtolower($belgeTipi['belge_tipi_izinli_formatlar'] ?? ''))));
-        if (!in_array($uzanti, $izinliler, true)) {
+        // Liste boşsa kısıt yok; aşağıdaki tanim_DosyaFormatlari + MIME kontrolü yine uygulanır
+        if ($izinliler && !in_array($uzanti, $izinliler, true)) {
             return ['hata' => 'Bu belge tipi için izin verilen formatlar: ' . strtoupper(implode(', ', $izinliler))];
         }
 
@@ -584,19 +593,9 @@ class BelgeServis {
             return ['success' => false, 'message' => 'Belge bulunamadı!'];
         }
 
-        $durum = $db->fetchOne("
-            SELECT onay_durumu_id, onay_durumu_kod
-            FROM dbo.tanim_BelgeOnayDurumlari
-            WHERE onay_durumu_id = ? AND onay_durumu_durum = 1
-        ", [$onayDurumuId]);
-
-        if (!$durum) {
-            return ['success' => false, 'message' => 'Geçersiz onay durumu!'];
-        }
-
-        // Red ve revizyon durumlarında gerekçe zorunlu
-        if (in_array($durum['onay_durumu_kod'], ['REDDEDILDI', 'REVIZYON'], true) && $onayAciklama === null) {
-            return ['success' => false, 'message' => 'Bu durum için açıklama girmelisiniz!'];
+        $hata = self::onayDurumuDogrula($db, $onayDurumuId, $onayAciklama);
+        if ($hata !== null) {
+            return ['success' => false, 'message' => $hata];
         }
 
         $db->update('dbo.Firma_Belgeleri', [
@@ -609,6 +608,98 @@ class BelgeServis {
         ], ['firma_belge_id' => $belgeId]);
 
         return ['success' => true, 'message' => 'Onay durumu güncellendi'];
+    }
+
+    /**
+     * Toplu onay durumu güncelleme (seçili belgeler tek UPDATE ile)
+     */
+    public static function topluOnayKaydet($db, $firmaScopeIds, $permissions, $userId, $post) {
+        if (empty($permissions['can_edit'])) {
+            return ['success' => false, 'message' => 'Onay işlemi yetkiniz yok!'];
+        }
+
+        $belgeIdler = array_values(array_unique(array_filter(
+            array_map('intval', (array)($post['firma_belge_ids'] ?? [])),
+            fn($id) => $id > 0
+        )));
+
+        if (!$belgeIdler) {
+            return ['success' => false, 'message' => 'Belge seçilmedi!'];
+        }
+        if (count($belgeIdler) > 500) {
+            return ['success' => false, 'message' => 'Tek seferde en fazla 500 belge güncellenebilir!'];
+        }
+
+        $onayDurumuId = (int)($post['firma_belge_onay_durumu_id'] ?? 0);
+        $onayAciklama = trim($post['firma_belge_onay_aciklama'] ?? '') ?: null;
+
+        $hata = self::onayDurumuDogrula($db, $onayDurumuId, $onayAciklama);
+        if ($hata !== null) {
+            return ['success' => false, 'message' => $hata];
+        }
+
+        // Yalnız kullanıcının firma kapsamındaki belgeler güncellenir
+        [$scopeSql, $scopeParams] = PageAuth::firmaScopeWhere($firmaScopeIds, 'firma_id');
+        $yerTutucu = implode(',', array_fill(0, count($belgeIdler), '?'));
+
+        $kapsamdakiler = $db->fetchAll("
+            SELECT firma_belge_id
+            FROM dbo.Firma_Belgeleri
+            WHERE firma_belge_id IN ($yerTutucu) AND $scopeSql
+        ", array_merge($belgeIdler, $scopeParams));
+
+        $guncellenecek = array_map(fn($r) => (int)$r['firma_belge_id'], $kapsamdakiler);
+        if (!$guncellenecek) {
+            return ['success' => false, 'message' => 'Seçili belgeler bulunamadı!'];
+        }
+
+        $simdi = date('Y-m-d H:i:s');
+        $yerTutucu = implode(',', array_fill(0, count($guncellenecek), '?'));
+
+        $sonuc = $db->execute("
+            UPDATE dbo.Firma_Belgeleri SET
+                firma_belge_onay_durumu_id           = ?,
+                firma_belge_onay_aciklama            = ?,
+                firma_belge_onaylayan_kullanici_id   = ?,
+                firma_belge_onay_tarihi              = ?,
+                firma_belge_guncelleme_tarihi        = ?,
+                firma_belge_guncelleyen_kullanici_id = ?
+            WHERE firma_belge_id IN ($yerTutucu)
+        ", array_merge([$onayDurumuId, $onayAciklama, $userId, $simdi, $simdi, $userId], $guncellenecek));
+
+        if (!$sonuc) {
+            return ['success' => false, 'message' => 'Güncelleme sırasında hata oluştu!'];
+        }
+
+        $atlanan = count($belgeIdler) - count($guncellenecek);
+        $mesaj = count($guncellenecek) . ' belgenin onay durumu güncellendi';
+        if ($atlanan > 0) {
+            $mesaj .= " ($atlanan belge yetki kapsamı dışında olduğu için atlandı)";
+        }
+
+        return ['success' => true, 'message' => $mesaj, 'guncellenen' => count($guncellenecek)];
+    }
+
+    /**
+     * Onay durumu ve gerekçe kontrolü; hata yoksa null döner
+     */
+    private static function onayDurumuDogrula($db, $onayDurumuId, $onayAciklama) {
+        $durum = $db->fetchOne("
+            SELECT onay_durumu_id, onay_durumu_kod
+            FROM dbo.tanim_BelgeOnayDurumlari
+            WHERE onay_durumu_id = ? AND onay_durumu_durum = 1
+        ", [$onayDurumuId]);
+
+        if (!$durum) {
+            return 'Geçersiz onay durumu!';
+        }
+
+        // Red ve revizyon durumlarında gerekçe zorunlu
+        if (in_array($durum['onay_durumu_kod'], ['REDDEDILDI', 'REVIZYON'], true) && $onayAciklama === null) {
+            return 'Bu durum için açıklama girmelisiniz!';
+        }
+
+        return null;
     }
 
     /**

@@ -90,6 +90,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         b.belge_tipi_ikon,
                         b.belge_tipi_zorunlu,
                         b.belge_tipi_coklu_yukleme,
+                        b.belge_tipi_dosya_zorunlu,
                         b.belge_tipi_gecerlilik_ay,
                         b.belge_tipi_izinli_formatlar,
                         b.belge_tipi_max_boyut_mb,
@@ -166,17 +167,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // İzinli formatlar yalnızca tanımlı ve aktif uzantılardan seçilebilir
+                // İzinli formatlar yalnızca tanımlı ve aktif uzantılardan seçilebilir.
+                // Boş bırakılırsa sistemde tanımlı tüm aktif formatlar kabul edilir.
                 $secilenFormatlar = $_POST['belge_tipi_izinli_formatlar'] ?? [];
                 if (!is_array($secilenFormatlar)) {
-                    $secilenFormatlar = array_filter(array_map('trim', explode(',', (string)$secilenFormatlar)));
+                    $secilenFormatlar = explode(',', (string)$secilenFormatlar);
                 }
-                $secilenFormatlar = array_values(array_unique(array_map('strtolower', $secilenFormatlar)));
-
-                if (empty($secilenFormatlar)) {
-                    echo json_encode(['success' => false, 'message' => 'En az bir dosya formatı seçmelisiniz!']);
-                    break;
-                }
+                $secilenFormatlar = array_values(array_unique(array_filter(array_map(
+                    fn($f) => strtolower(trim((string)$f)),
+                    $secilenFormatlar
+                ))));
 
                 $gecerliFormatlar = array_column($db->fetchAll("
                     SELECT dosya_formati_uzanti
@@ -211,6 +211,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'belge_tipi_ikon'             => trim($_POST['belge_tipi_ikon'] ?? '') ?: null,
                     'belge_tipi_zorunlu'          => isset($_POST['belge_tipi_zorunlu']) ? 1 : 0,
                     'belge_tipi_coklu_yukleme'    => isset($_POST['belge_tipi_coklu_yukleme']) ? 1 : 0,
+                    'belge_tipi_dosya_zorunlu'    => isset($_POST['belge_tipi_dosya_zorunlu']) ? 1 : 0,
                     'belge_tipi_gecerlilik_ay'    => $gecerlilikAy,
                     'belge_tipi_izinli_formatlar' => implode(',', $secilenFormatlar),
                     'belge_tipi_max_boyut_mb'     => $maxBoyut,
@@ -530,9 +531,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
 
                             <div class="col-md-12">
-                                <label for="belge_tipi_izinli_formatlar" class="form-label">İzinli Dosya Formatları <span class="text-danger">*</span></label>
+                                <label for="belge_tipi_izinli_formatlar" class="form-label">İzinli Dosya Formatları</label>
                                 <select class="form-select" id="belge_tipi_izinli_formatlar" name="belge_tipi_izinli_formatlar[]" multiple style="width: 100%;"></select>
-                                <small class="text-muted">Bu belge tipi için yüklenebilecek dosya uzantıları</small>
+                                <small class="text-muted">Bu belge tipi için yüklenebilecek dosya uzantıları. Boş bırakılırsa sistemde tanımlı tüm formatlar kabul edilir.</small>
                             </div>
 
                             <div class="col-md-4">
@@ -560,23 +561,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <small class="text-muted">Bootstrap Icons sınıfı (örn: <code>bi bi-receipt</code>)</small>
                             </div>
 
-                            <div class="col-md-4">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="belge_tipi_zorunlu" name="belge_tipi_zorunlu">
+                            <div class="col-md-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="belge_tipi_zorunlu" name="belge_tipi_zorunlu" value="1">
                                     <label class="form-check-label" for="belge_tipi_zorunlu">Zorunlu Belge</label>
                                 </div>
+                                <small class="text-muted">Her firmada bu belge bulunmalı (eksik belge takibi)</small>
                             </div>
 
-                            <div class="col-md-4">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="belge_tipi_coklu_yukleme" name="belge_tipi_coklu_yukleme">
+                            <div class="col-md-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="belge_tipi_dosya_zorunlu" name="belge_tipi_dosya_zorunlu" value="1" checked>
+                                    <label class="form-check-label" for="belge_tipi_dosya_zorunlu">Dosya Gerekli</label>
+                                </div>
+                                <small class="text-muted">Kapalıysa kayıt dosya yüklenmeden açılabilir</small>
+                            </div>
+
+                            <div class="col-md-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="belge_tipi_coklu_yukleme" name="belge_tipi_coklu_yukleme" value="1">
                                     <label class="form-check-label" for="belge_tipi_coklu_yukleme">Çoklu Yükleme</label>
                                 </div>
                             </div>
 
-                            <div class="col-md-4">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="belge_tipi_durum" name="belge_tipi_durum" checked>
+                            <div class="col-md-6">
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="belge_tipi_durum" name="belge_tipi_durum" value="1" checked>
                                     <label class="form-check-label" for="belge_tipi_durum">Aktif</label>
                                 </div>
                             </div>
@@ -788,17 +798,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     .split(',')
                     .filter(f => f.trim() !== '')
                     .map(f => `<span class="badge text-bg-secondary format-badge">${escapeHtml(f.trim().toUpperCase())}</span>`)
-                    .join('') || '<span class="text-muted">-</span>';
+                    .join('') || '<span class="badge text-bg-light border">Tüm formatlar</span>';
 
                 const gecerlilik = bt.belge_tipi_gecerlilik_ay
                     ? `<span class="badge text-bg-info">${bt.belge_tipi_gecerlilik_ay} ay</span>`
                     : '<span class="text-muted">Süresiz</span>';
 
-                const zorunlu = bt.belge_tipi_zorunlu
+                let zorunlu = bt.belge_tipi_zorunlu == 1
                     ? '<span class="badge text-bg-warning">Zorunlu</span>'
                     : '<span class="text-muted">İsteğe bağlı</span>';
+                if (bt.belge_tipi_dosya_zorunlu == 0) {
+                    zorunlu += '<br><span class="badge text-bg-light border"><i class="bi bi-file-earmark-x"></i> Dosyasız</span>';
+                }
 
-                const coklu = bt.belge_tipi_coklu_yukleme
+                const coklu = bt.belge_tipi_coklu_yukleme == 1
                     ? '<i class="bi bi-check-lg text-success"></i>'
                     : '<i class="bi bi-dash text-muted"></i>';
 
@@ -898,6 +911,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         document.getElementById('belge_tipi_sira_no').value = bt.belge_tipi_sira_no || 0;
                         document.getElementById('belge_tipi_zorunlu').checked = bt.belge_tipi_zorunlu == 1;
                         document.getElementById('belge_tipi_coklu_yukleme').checked = bt.belge_tipi_coklu_yukleme == 1;
+                        document.getElementById('belge_tipi_dosya_zorunlu').checked = bt.belge_tipi_dosya_zorunlu != 0;
                         document.getElementById('belge_tipi_durum').checked = bt.belge_tipi_durum == 1;
 
                         $('#ikon_onizleme').attr('class', bt.belge_tipi_ikon || 'bi bi-question-circle');

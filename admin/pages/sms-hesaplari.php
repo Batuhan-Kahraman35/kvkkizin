@@ -286,9 +286,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 SmsApi::testKaydet($id, $sonuc['success'], $mesaj, $sonuc['kredi']);
 
+                // Test sonucuna göre hesap durumu: başarılı → aktif, hatalı → pasif (düzenleme yetkisi gerekir)
+                $durumMesaj = '';
+                $yeniDurum = $sonuc['success'] ? 1 : 0;
+                if ($permissions['can_edit'] && (int)$hesap['Durum'] !== $yeniDurum) {
+                    $durumData = [
+                        'Durum'                => $yeniDurum,
+                        'GuncellemeTarihi'     => date('Y-m-d H:i:s'),
+                        'GuncelleyenKullanici' => $user['kullanici_id'],
+                    ];
+
+                    // Firmada aktif varsayılan hesap varsa mevcut varsayılan korunur (UX_SmsHesaplari_FirmaVarsayilan)
+                    if ($yeniDurum && $hesap['sms_hesap_varsayilan']) {
+                        $digerVarsayilan = $db->fetchOne("
+                            SELECT TOP 1 sms_hesap_id FROM SmsHesaplari
+                            WHERE sms_hesap_firma_id = ? AND sms_hesap_id <> ? AND sms_hesap_varsayilan = 1 AND Durum = 1
+                        ", [$hesap['sms_hesap_firma_id'], $id]);
+                        if ($digerVarsayilan) {
+                            $durumData['sms_hesap_varsayilan'] = 0;
+                        }
+                    }
+
+                    $db->update('SmsHesaplari', $durumData, ['sms_hesap_id' => $id]);
+                    $durumMesaj = $yeniDurum ? 'Hesap aktif edildi.' : 'Hesap pasife alındı.';
+                }
+
                 echo json_encode([
                     'success' => $sonuc['success'],
-                    'message' => $mesaj,
+                    'message' => $mesaj . ($durumMesaj ? ' — ' . $durumMesaj : ''),
                     'kredi'   => $sonuc['kredi'],
                     'yanit'   => mb_substr((string)$sonuc['ham'], 0, 1000, 'UTF-8'),
                 ]);

@@ -78,6 +78,11 @@ $filtreOlustur = function (array $girdi) use ($firmaScopeIds) {
         $params[] = (int)$girdi['odeme_durumu_id'];
     }
 
+    if (!empty($girdi['satis_personeli_id'])) {
+        $kosullar[] = 's.firma_sozlesme_satis_personeli_id = ?';
+        $params[] = (int)$girdi['satis_personeli_id'];
+    }
+
     if (!empty($girdi['yil']) && ctype_digit((string)$girdi['yil'])) {
         $yil = (int)$girdi['yil'];
         $kosullar[] = 's.firma_sozlesme_baslangic_tarihi >= ? AND s.firma_sozlesme_baslangic_tarihi < ?';
@@ -115,6 +120,26 @@ $filtreOlustur = function (array $girdi) use ($firmaScopeIds) {
     return [implode(' AND ', $kosullar), $params];
 };
 
+// Satış personeli seçilebilecek kullanıcılar: tüm departmanlar, aktif
+$satisPersonelleri = function ($kullaniciId = null) use ($db, $firmaScopeIds) {
+    [$scopeSql, $params] = PageAuth::firmaScopeWhere($firmaScopeIds, 'k.kullanici_firma_id');
+    $kosul = "k.kullanici_durum = 1 AND $scopeSql";
+    if ($kullaniciId !== null) {
+        $kosul .= ' AND k.kullanici_id = ?';
+        $params[] = (int)$kullaniciId;
+    }
+    return $db->fetchAll("
+        SELECT k.kullanici_id,
+               LTRIM(RTRIM(ISNULL(k.kullanici_ad, '') + ' ' + ISNULL(k.kullanici_soyad, ''))) AS ad_soyad,
+               k.kullanici_email,
+               ISNULL(d.departman_adi, 'Departmansız') AS departman_adi
+        FROM dbo.kullanicilar k
+        LEFT JOIN dbo.Kullanici_Departmanlar d ON d.departman_id = k.kullanici_departman_id
+        WHERE $kosul
+        ORDER BY departman_adi, ad_soyad
+    ", $params);
+};
+
 $tarihGecerli = function ($tarih) {
     $d = DateTime::createFromFormat('Y-m-d', (string)$tarih);
     return $d && $d->format('Y-m-d') === $tarih;
@@ -144,7 +169,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     3 => 's.firma_sozlesme_tutar',
                     4 => 's.odeme_durumu_id',
                     5 => 's.firma_sozlesme_odeme_tarihi',
-                    6 => 's.firma_sozlesme_durum',
+                    7 => 's.firma_sozlesme_durum',
                 ];
                 $kolonIndex = (int)($_POST['order'][0]['column'] ?? 2);
                 $siralaKolon = $siralamaKolonlari[$kolonIndex] ?? 's.firma_sozlesme_bitis_tarihi';
@@ -191,12 +216,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         DATEDIFF(DAY, CAST(GETDATE() AS DATE), s.firma_sozlesme_bitis_tarihi)     AS kalan_gun,
                         DATEDIFF(DAY, CAST(GETDATE() AS DATE), s.firma_sozlesme_baslangic_tarihi) AS baslamaya_gun,
                         o.odeme_durumu_adi, o.odeme_durumu_renk, o.odeme_durumu_ikon, o.odeme_durumu_odendi,
-                        LTRIM(RTRIM(ISNULL(k.kullanici_ad, '') + ' ' + ISNULL(k.kullanici_soyad, ''))) AS olusturan
+                        LTRIM(RTRIM(ISNULL(k.kullanici_ad, '') + ' ' + ISNULL(k.kullanici_soyad, ''))) AS olusturan,
+                        NULLIF(LTRIM(RTRIM(ISNULL(sp.kullanici_ad, '') + ' ' + ISNULL(sp.kullanici_soyad, ''))), '') AS satis_personeli
                     FROM Sayfa p
                     INNER JOIN dbo.Firma_Sozlesmeleri s ON s.firma_sozlesme_id = p.firma_sozlesme_id
                     INNER JOIN dbo.Firmalar f ON f.firma_id = s.firma_id
                     LEFT JOIN dbo.tanim_SozlesmeOdemeDurumlari o ON o.odeme_durumu_id = s.odeme_durumu_id
                     LEFT JOIN dbo.kullanicilar k ON k.kullanici_id = s.firma_sozlesme_olusturan_kullanici_id
+                    LEFT JOIN dbo.kullanicilar sp ON sp.kullanici_id = s.firma_sozlesme_satis_personeli_id
                     ORDER BY p.sira
                 ", array_merge($filtreParams, [$start, $length]));
 
@@ -239,25 +266,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ]]);
                 break;
 
-            case 'yillik_ozet':
-                [$filtreSql, $filtreParams] = $filtreOlustur($_POST);
-                $yillar = $db->fetchAll("
-                    SELECT
-                        YEAR(s.firma_sozlesme_baslangic_tarihi) AS yil,
-                        COUNT(*) AS sozlesme_sayisi,
-                        COUNT(DISTINCT s.firma_id) AS firma_sayisi,
-                        SUM(s.firma_sozlesme_tutar) AS toplam,
-                        SUM(CASE WHEN o.odeme_durumu_odendi = 1 THEN s.firma_sozlesme_tutar ELSE 0 END) AS odenen,
-                        SUM(CASE WHEN ISNULL(o.odeme_durumu_odendi, 0) = 0 THEN s.firma_sozlesme_tutar ELSE 0 END) AS bekleyen
-                    FROM dbo.Firma_Sozlesmeleri s
-                    LEFT JOIN dbo.tanim_SozlesmeOdemeDurumlari o ON o.odeme_durumu_id = s.odeme_durumu_id
-                    WHERE s.firma_sozlesme_durum = 1 AND $filtreSql
-                    GROUP BY YEAR(s.firma_sozlesme_baslangic_tarihi)
-                    ORDER BY yil DESC
-                ", $filtreParams);
-                echo json_encode(['success' => true, 'data' => $yillar]);
-                break;
-
             case 'yil_list':
                 [$scopeSql, $scopeParams] = PageAuth::firmaScopeWhere($firmaScopeIds, 's.firma_id');
                 $yillar = $db->fetchAll("
@@ -284,6 +292,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 echo json_encode(['success' => true, 'data' => $firmalar]);
                 break;
 
+            case 'satis_personeli_list':
+                // Tüm departmanlardaki aktif kullanıcılar (firma kapsamı varsa yalnız kapsamdakiler)
+                echo json_encode(['success' => true, 'data' => $satisPersonelleri()]);
+                break;
+
             case 'odeme_durumu_list':
                 $durumlar = $db->fetchAll("
                     SELECT odeme_durumu_id, odeme_durumu_adi, odeme_durumu_renk, odeme_durumu_odendi, odeme_durumu_varsayilan
@@ -301,7 +314,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                            CONVERT(VARCHAR(10), firma_sozlesme_baslangic_tarihi, 23) AS firma_sozlesme_baslangic_tarihi,
                            CONVERT(VARCHAR(10), firma_sozlesme_bitis_tarihi, 23)     AS firma_sozlesme_bitis_tarihi,
                            CONVERT(VARCHAR(10), firma_sozlesme_odeme_tarihi, 23)     AS firma_sozlesme_odeme_tarihi,
-                           firma_sozlesme_tutar, odeme_durumu_id, firma_sozlesme_aciklama, firma_sozlesme_durum
+                           firma_sozlesme_tutar, odeme_durumu_id, firma_sozlesme_aciklama, firma_sozlesme_durum,
+                           firma_sozlesme_satis_personeli_id,
+                           (SELECT LTRIM(RTRIM(ISNULL(sp.kullanici_ad, '') + ' ' + ISNULL(sp.kullanici_soyad, '')))
+                              FROM dbo.kullanicilar sp WHERE sp.kullanici_id = firma_sozlesme_satis_personeli_id) AS satis_personeli_adi
                     FROM dbo.Firma_Sozlesmeleri
                     WHERE firma_sozlesme_id = ?
                 ", [$id]);
@@ -334,8 +350,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $tutarHam   = str_replace([' ', ','], ['', '.'], trim($_POST['firma_sozlesme_tutar'] ?? ''));
 
                 // Mevcut kayıt ve kapsam kontrolü
+                $mevcut = null;
                 if ($id > 0) {
-                    $mevcut = $db->fetchOne("SELECT firma_id FROM dbo.Firma_Sozlesmeleri WHERE firma_sozlesme_id = ?", [$id]);
+                    $mevcut = $db->fetchOne("SELECT firma_id, firma_sozlesme_satis_personeli_id FROM dbo.Firma_Sozlesmeleri WHERE firma_sozlesme_id = ?", [$id]);
                     if (!$mevcut || !$sozlesmeDegistirilebilir($mevcut['firma_id'])) {
                         echo json_encode(['success' => false, 'message' => 'Bu sözleşmeyi değiştirme yetkiniz yok']);
                         break;
@@ -381,6 +398,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $odemeTarih = '';
                 }
 
+                // Satış personeli isteğe bağlı; seçildiyse listedeki aktif kullanıcılardan olmalı
+                // (kayıtta zaten olan personel pasife alınmış olsa da korunur)
+                $satisPersoneliId = (int)($_POST['firma_sozlesme_satis_personeli_id'] ?? 0);
+                $degismedi = $mevcut && (int)$mevcut['firma_sozlesme_satis_personeli_id'] === $satisPersoneliId;
+                if ($satisPersoneliId > 0 && !$degismedi && !$satisPersonelleri($satisPersoneliId)) {
+                    echo json_encode(['success' => false, 'message' => 'Geçerli bir satış personeli seçin']);
+                    break;
+                }
+
                 $durum = isset($_POST['firma_sozlesme_durum']) ? 1 : 0;
 
                 // Aynı firmada çakışan aktif sözleşme olmamalı
@@ -408,6 +434,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'firma_sozlesme_odeme_tarihi'     => $odemeTarih !== '' ? $odemeTarih : null,
                     'firma_sozlesme_aciklama'         => $aciklama !== '' ? mb_substr($aciklama, 0, 500) : null,
                     'firma_sozlesme_durum'            => $durum,
+                    'firma_sozlesme_satis_personeli_id' => $satisPersoneliId > 0 ? $satisPersoneliId : null,
                 ];
 
                 if ($id > 0) {
@@ -468,7 +495,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .status-active { background-color: #d4edda; color: #155724; }
         .status-inactive { background-color: #f8d7da; color: #721c24; }
         .tutar { white-space: nowrap; font-variant-numeric: tabular-nums; }
-        #yillikOzetTable td, #yillikOzetTable th { white-space: nowrap; }
     </style>
 </head>
 <body class="layout-fixed sidebar-expand-lg sidebar-open bg-body-tertiary">
@@ -583,6 +609,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         </select>
                                     </div>
                                     <div class="col-md-4">
+                                        <label class="form-label">Satış Personeli</label>
+                                        <select class="form-select select2-filter" id="filter_satis_personeli_id" style="width: 100%;">
+                                            <option value="">Tümü</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-4">
                                         <label class="form-label">Durum</label>
                                         <select class="form-select select2-filter" id="filter_status" style="width: 100%;">
                                             <option value="">Tümü</option>
@@ -601,7 +633,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     <div class="row">
                         <!-- Sözleşme listesi -->
-                        <div class="col-xl-9">
+                        <div class="col-12">
                             <div class="card">
                                 <div class="card-header">
                                     <h3 class="card-title">Sözleşme Listesi</h3>
@@ -623,38 +655,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                                 <th>Tutar</th>
                                                 <th>Ödeme</th>
                                                 <th>Ödeme Tarihi</th>
+                                                <th>Satış Personeli</th>
                                                 <th>Durum</th>
                                                 <th>İşlemler</th>
                                             </tr>
                                         </thead>
                                         <tbody></tbody>
                                     </table>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Yıllık ödeme özeti -->
-                        <div class="col-xl-3">
-                            <div class="card card-outline card-success">
-                                <div class="card-header">
-                                    <h3 class="card-title"><i class="bi bi-calendar3"></i> Yıllık Ödeme Özeti</h3>
-                                </div>
-                                <div class="card-body p-0">
-                                    <table class="table table-sm mb-0" id="yillikOzetTable">
-                                        <thead>
-                                            <tr>
-                                                <th>Yıl</th>
-                                                <th class="text-end">Ödenen</th>
-                                                <th class="text-end">Bekleyen</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <tr><td colspan="3" class="text-center text-muted py-3">Yükleniyor...</td></tr>
-                                        </tbody>
-                                    </table>
-                                </div>
-                                <div class="card-footer small text-muted">
-                                    Sözleşme başlangıç yılına göre gruplanır, filtreler uygulanır. Pasif sözleşmeler dahil edilmez.
                                 </div>
                             </div>
                         </div>
@@ -679,10 +686,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <input type="hidden" id="firma_sozlesme_id" name="firma_sozlesme_id" value="">
 
                         <div class="row g-3">
-                            <div class="col-md-12">
+                            <div class="col-md-7">
                                 <label for="firma_id" class="form-label">Firma <span class="text-danger">*</span></label>
                                 <select class="form-select" id="firma_id" name="firma_id" style="width: 100%;" required></select>
                                 <small class="text-muted">Üst firmanın sözleşmesi bitince, kendi geçerli sözleşmesi olmayan alt firmalar da giriş yapamaz.</small>
+                            </div>
+
+                            <div class="col-md-5">
+                                <label for="firma_sozlesme_satis_personeli_id" class="form-label">Satış Personeli</label>
+                                <select class="form-select" id="firma_sozlesme_satis_personeli_id" name="firma_sozlesme_satis_personeli_id" style="width: 100%;"></select>
                             </div>
 
                             <div class="col-md-6">
@@ -791,6 +803,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $('.select2-filter').select2({ theme: 'bootstrap-5', width: '100%', placeholder: 'Seçiniz...', allowClear: true });
             $('#firma_id, #odeme_durumu_id').select2({ theme: 'bootstrap-5', width: '100%', placeholder: 'Seçiniz...', dropdownParent: $('#sozlesmeModal') });
+            $('#firma_sozlesme_satis_personeli_id').select2({ theme: 'bootstrap-5', width: '100%', placeholder: 'Seçiniz...', allowClear: true, dropdownParent: $('#sozlesmeModal') });
 
             // URL'den gelen firma filtresi (?firma_id=)
             const urlFirmaId = new URLSearchParams(window.location.search).get('firma_id');
@@ -854,6 +867,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <i class="${escapeHtml(r.odeme_durumu_ikon || 'bi bi-dot')}"></i> ${escapeHtml(v || '-')}</span>`;
                     }},
                     { data: 'odeme_tarihi', render: v => formatTarih(v) || '<span class="text-muted">-</span>' },
+                    { data: 'satis_personeli', orderable: false, render: v => v ? escapeHtml(v) : '<span class="text-muted">-</span>' },
                     { data: 'durum', render: v => v == 1
                         ? '<span class="status-badge status-active">Aktif</span>'
                         : '<span class="status-badge status-inactive">Pasif</span>' },
@@ -874,12 +888,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ],
                 initComplete: function() {
                     loadStats();
-                    loadYillikOzet();
                 }
             });
 
             loadFirmalar();
             loadOdemeDurumlari();
+            loadSatisPersonelleri();
             loadYillar();
 
             $('#firma_sozlesme_baslangic_tarihi').on('change', function() {
@@ -904,6 +918,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     yil: $('#filter_yil').val(),
                     gecerlilik: $('#filter_gecerlilik').val(),
                     odeme_durumu_id: $('#filter_odeme_durumu_id').val(),
+                    satis_personeli_id: $('#filter_satis_personeli_id').val(),
                     status: $('#filter_status').val()
                 };
                 Object.keys(currentfilters).forEach(k => { if (!currentfilters[k]) delete currentfilters[k]; });
@@ -922,7 +937,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         function listeYenile(sayfayiKoru) {
             dataTable.ajax.reload(null, !sayfayiKoru);
-            loadYillikOzet();
         }
 
         function loadStats() {
@@ -932,25 +946,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $('#stat-yaklasan').text(r.data.yaklasan);
                 $('#stat-kapali').text(r.data.kapali_firma);
                 $('#stat-odenen').text(formatPara(r.data.bu_yil_odenen));
-            }, 'json');
-        }
-
-        function loadYillikOzet() {
-            $.post('', { action: 'yillik_ozet', ...currentfilters }, function(r) {
-                const $tbody = $('#yillikOzetTable tbody').empty();
-                if (!r.success || !r.data.length) {
-                    $tbody.append('<tr><td colspan="3" class="text-center text-muted py-3">Kayıt yok</td></tr>');
-                    return;
-                }
-                r.data.forEach(y => {
-                    $tbody.append(`
-                        <tr title="${y.sozlesme_sayisi} sözleşme · ${y.firma_sayisi} firma · Toplam ${formatPara(y.toplam)}">
-                            <td><strong>${escapeHtml(y.yil)}</strong><br><small class="text-muted">${y.sozlesme_sayisi} sözleşme</small></td>
-                            <td class="text-end tutar text-success">${formatPara(y.odenen)}</td>
-                            <td class="text-end tutar ${parseFloat(y.bekleyen) > 0 ? 'text-warning' : 'text-muted'}">${formatPara(y.bekleyen)}</td>
-                        </tr>
-                    `);
-                });
             }, 'json');
         }
 
@@ -983,6 +978,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $filtre.trigger('change.select2');
                 $modal.trigger('change.select2');
             }, 'json');
+        }
+
+        // Satış personeli: tüm departmanlardaki aktif kullanıcılar, departmana göre gruplu
+        function loadSatisPersonelleri() {
+            $.post('', { action: 'satis_personeli_list' }, function(r) {
+                if (!r.success) return;
+                const $filtre = $('#filter_satis_personeli_id');
+                const $modal = $('#firma_sozlesme_satis_personeli_id').empty().append(new Option('', '', false, false));
+                const gruplar = {};
+                r.data.forEach(p => {
+                    (gruplar[p.departman_adi] = gruplar[p.departman_adi] || []).push(p);
+                });
+                Object.keys(gruplar).forEach(dep => {
+                    const $gF = $('<optgroup>').attr('label', dep);
+                    const $gM = $('<optgroup>').attr('label', dep);
+                    gruplar[dep].forEach(p => {
+                        const etiket = p.ad_soyad || p.kullanici_email || ('#' + p.kullanici_id);
+                        $gF.append(new Option(etiket, p.kullanici_id, false, false));
+                        $gM.append(new Option(etiket, p.kullanici_id, false, false));
+                    });
+                    $filtre.append($gF);
+                    $modal.append($gM);
+                });
+                $filtre.trigger('change.select2');
+                $modal.trigger('change.select2');
+            }, 'json');
+        }
+
+        // Kayıttaki personel listede yoksa (pasife alınmış) geçici seçenek olarak eklenir
+        function satisPersoneliSec(id, ad) {
+            const $s = $('#firma_sozlesme_satis_personeli_id');
+            if (id && !$s.find(`option[value="${parseInt(id, 10)}"]`).length) {
+                $s.append(new Option((ad || ('#' + id)) + ' (pasif)', id, false, false));
+            }
+            $s.val(id || '').trigger('change.select2');
         }
 
         function loadYillar() {
@@ -1018,6 +1048,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $('#firma_sozlesme_id').val('');
             $('#firma_id').val(currentfilters.firma_id || '').trigger('change.select2');
             $('#odeme_durumu_id').val(varsayilanOdemeDurumu()).trigger('change.select2');
+            $('#firma_sozlesme_satis_personeli_id').val('').trigger('change.select2');
             odemeTarihiDurumu();
         }
 
@@ -1050,6 +1081,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 odemeTarihiDurumu();
                 $('#firma_sozlesme_aciklama').val(s.firma_sozlesme_aciklama || '');
                 $('#firma_sozlesme_durum').prop('checked', s.firma_sozlesme_durum == 1);
+                satisPersoneliSec(s.firma_sozlesme_satis_personeli_id, s.satis_personeli_adi);
                 $('#sozlesmeModalLabel').text('Sözleşme Düzenle');
                 sozlesmeModal.show();
             });
@@ -1064,6 +1096,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $('#firma_sozlesme_baslangic_tarihi').val(bas);
                 $('#firma_sozlesme_bitis_tarihi').val(tarihEkle(bas, 1, -1));
                 $('#firma_sozlesme_tutar').val(s.firma_sozlesme_tutar);
+                satisPersoneliSec(s.firma_sozlesme_satis_personeli_id, s.satis_personeli_adi);
                 $('#sozlesmeModalLabel').text('Sonraki Dönem Sözleşmesi');
                 sozlesmeModal.show();
             });

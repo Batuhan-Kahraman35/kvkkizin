@@ -939,8 +939,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </div>
 
                             <div class="col-md-12">
-                                <div class="form-check">
-                                    <input class="form-check-input" type="checkbox" id="firma_belge_durum" name="firma_belge_durum" checked>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" role="switch" id="firma_belge_durum" name="firma_belge_durum" value="1" checked>
                                     <label class="form-check-label" for="firma_belge_durum">Aktif</label>
                                 </div>
                             </div>
@@ -1221,24 +1221,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? escapeHtml(firma.firma_ticari_unvan.length > 40 ? firma.firma_ticari_unvan.substring(0, 40) + '...' : firma.firma_ticari_unvan)
                     : '-';
 
-                // Belge özeti rozetleri
+                // Belge özeti: toplam aktif belge + onay durumlarına göre adetler (Firma Belgeleri kayıtlarından)
                 const belgeSayisi = parseInt(firma.belge_sayisi || 0, 10);
-                const eksikZorunlu = parseInt(firma.eksik_zorunlu_belge || 0, 10);
-                const suresiDolan = parseInt(firma.suresi_dolan_belge || 0, 10);
-                const bekleyen = parseInt(firma.bekleyen_belge || 0, 10);
+                let onayOzet = [];
+                try { onayOzet = JSON.parse(firma.belge_onay_ozet || '[]'); } catch (e) { onayOzet = []; }
 
-                let belgeHucre = `<span class="badge bg-secondary" title="Toplam aktif belge">${belgeSayisi}</span>`;
-                if (eksikZorunlu > 0) {
-                    belgeHucre += ` <span class="badge bg-danger" title="Eksik zorunlu belge">${eksikZorunlu} eksik</span>`;
-                }
-                if (suresiDolan > 0) {
-                    belgeHucre += ` <span class="badge bg-warning text-dark" title="Süresi dolan veya 30 gün içinde dolacak">${suresiDolan}</span>`;
-                }
-                if (bekleyen > 0) {
-                    belgeHucre += ` <span class="badge bg-info" title="Onay bekleyen">${bekleyen}</span>`;
-                }
-                if (belgeSayisi === 0 && eksikZorunlu === 0) {
-                    belgeHucre = '<span class="text-muted">-</span>';
+                let belgeHucre = '<span class="text-muted">-</span>';
+                if (belgeSayisi > 0) {
+                    belgeHucre = `<span class="badge bg-secondary" title="Toplam aktif belge">${belgeSayisi}</span>`;
+                    onayOzet.forEach(o => {
+                        belgeHucre += ` <span class="badge text-bg-${escapeHtml(o.renk || 'secondary')}" title="${escapeHtml(o.adi)}">` +
+                            `<i class="${escapeHtml(o.ikon || 'bi bi-dot')}"></i> ${parseInt(o.adet, 10)}</span>`;
+                    });
                 }
 
                 if (permissions.canViewBelge) {
@@ -1528,7 +1522,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ? `<i class="${escapeHtml(b.belge_tipi_ikon)} me-1"></i>`
                     : '<i class="bi bi-file-earmark me-1"></i>';
 
-                const baslik = b.firma_belge_baslik || b.firma_belge_dosya_adi;
+                const dosyaVar = !!b.firma_belge_dosya_adi;
+                const baslik = b.firma_belge_baslik || b.firma_belge_dosya_adi || b.belge_tipi_adi;
 
                 // Geçerlilik
                 let gecerlilik;
@@ -1556,14 +1551,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     onay += `<br><small class="text-muted">${escapeHtml(b.firma_belge_onay_aciklama.length > 40 ? b.firma_belge_onay_aciklama.substring(0, 40) + '...' : b.firma_belge_onay_aciklama)}</small>`;
                 }
 
-                let islemler = `
+                let islemler = dosyaVar ? `
                     <a class="btn btn-sm btn-info" href="/admin/belge-indir.php?id=${b.firma_belge_id}&onizle=1" target="_blank" title="Önizle">
                         <i class="bi bi-eye"></i>
                     </a>
                     <a class="btn btn-sm btn-success" href="/admin/belge-indir.php?id=${b.firma_belge_id}" title="İndir">
                         <i class="bi bi-download"></i>
                     </a>
-                `;
+                ` : '';
                 if (permissions.belgeEdit) {
                     islemler += `
                         <button class="btn btn-sm btn-primary" onclick="belgeOnayAc(${b.firma_belge_id}, ${b.firma_belge_onay_durumu_id})" title="Onay Durumu">
@@ -1588,8 +1583,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <td>
                             <strong>${escapeHtml(baslik)}</strong><br>
                             <small class="text-muted">
-                                <span class="badge bg-secondary">${escapeHtml((b.firma_belge_dosya_uzanti || '').toUpperCase())}</span>
-                                ${escapeHtml(b.firma_belge_dosya_adi)} · ${belgeBoyutFormatla(b.firma_belge_dosya_boyut)}
+                                ${dosyaVar
+                                    ? `<span class="badge bg-secondary">${escapeHtml((b.firma_belge_dosya_uzanti || '').toUpperCase())}</span>
+                                       ${escapeHtml(b.firma_belge_dosya_adi)} · ${belgeBoyutFormatla(b.firma_belge_dosya_boyut)}`
+                                    : '<span class="badge text-bg-light border"><i class="bi bi-file-earmark-x"></i> Dosya yok</span>'}
                             </small>
                         </td>
                         <td>${gecerlilik}</td>
@@ -1628,8 +1625,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (tip.belge_tipi_gecerlilik_ay) bilgi.push(tip.belge_tipi_gecerlilik_ay + ' ay geçerli');
             $('#belge_tipi_bilgi').text(bilgi.join(' • '));
 
+            // Dosya gerektirmeyen tipte yıldız gizlenir; düzenlemede zaten gizli
+            const dosyaGerekli = tip.belge_tipi_dosya_zorunlu != 0;
+            $('#belge_dosya_zorunlu').toggleClass('d-none', !dosyaGerekli || duzenleme);
+
             $('#belge_dosya_yardim').text(
-                'İzinli formatlar: ' + formatlar.join(', ').toUpperCase() +
+                (dosyaGerekli ? '' : 'Bu belge tipinde dosya isteğe bağlıdır • ') +
+                'İzinli formatlar: ' + (formatlar.length ? formatlar.join(', ').toUpperCase() : 'Tüm tanımlı formatlar') +
                 ' • Maksimum ' + tip.belge_tipi_max_boyut_mb + ' MB' +
                 (coklu ? ' • Birden fazla dosya seçebilirsiniz' : '') +
                 (coklu && duzenleme ? ' (ilk dosya mevcut dosyanın yerine geçer, diğerleri yeni belge olarak eklenir)' : '')
@@ -1686,7 +1688,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $('#belge_tipi_id').val(b.belge_tipi_id).trigger('change.select2');
                 belgeTipiBilgisiGoster(b.belge_tipi_id);
 
-                $('#belge_mevcut_dosya_adi').text(b.firma_belge_dosya_adi || '-');
+                $('#belge_mevcut_dosya_adi').text(b.firma_belge_dosya_adi || 'Dosya yok');
                 $('#belge_mevcut_dosya').removeClass('d-none');
                 $('#belge_dosya_zorunlu').addClass('d-none');
 
