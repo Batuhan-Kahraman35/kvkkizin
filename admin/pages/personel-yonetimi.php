@@ -482,7 +482,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $hedef = $db->fetchOne("
-                SELECT k.kullanici_email, k.kullanici_ad, k.kullanici_soyad, f.firma_email
+                SELECT k.kullanici_email, k.kullanici_ad, k.kullanici_soyad, k.kullanici_telefon, f.firma_email
                 FROM kullanicilar k
                 LEFT JOIN Firmalar f ON k.kullanici_firma_id = f.firma_id
                 WHERE k.kullanici_id = ?", [$id]);
@@ -503,6 +503,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'Kullanıcı Adı: ' . $hedef['kullanici_email'],
                 'Şifre: ' . $sifre,
             ];
+            // 2FA doğrulama kodu bu numaraya SMS ile gider (Auth::ikiFaktorKodGonder)
+            $telefon = trim($hedef['kullanici_telefon'] ?? '');
+            $satirlar[] = 'SMS Doğrulama Telefonu: ' . ($telefon !== '' ? $telefon : 'Tanımlı değil');
             if ($sifreDegistirmeli === 1) {
                 $satirlar[] = 'Not: İlk girişte şifre değiştirme zorunludur.';
             }
@@ -1172,7 +1175,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <i class="bi bi-pencil"></i>
                                 </a> `;
                                 if (data.kullanici_email) {
-                                    buttons += `<button class="btn btn-sm btn-secondary" onclick="girisBilgisiKopyala(${data.kullanici_id}, '${adSoyad}', '${data.kullanici_email}', ${data.kullanici_sifre_degistirmeli == 1 ? 1 : 0}, '${data.firma_email || ''}')" title="Giriş bilgilerini kopyala">
+                                    buttons += `<button class="btn btn-sm btn-secondary" onclick="girisBilgisiKopyala(${data.kullanici_id}, '${adSoyad}', '${data.kullanici_email}', ${data.kullanici_sifre_degistirmeli == 1 ? 1 : 0}, '${data.firma_email || ''}', '${data.kullanici_telefon || ''}')" title="Giriş bilgilerini kopyala">
                                         <i class="bi bi-clipboard"></i>
                                     </button> `;
                                 }
@@ -1426,7 +1429,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             });
         }
 
-        function girisBilgisiKopyala(id, adSoyad, email, sifreDegistirmeli, firmaEmail = '') {
+        function girisBilgisiKopyala(id, adSoyad, email, sifreDegistirmeli, firmaEmail = '', telefon = '') {
             Swal.fire({
                 title: 'Giriş Bilgilerini Kopyala',
                 width: 520,
@@ -1440,6 +1443,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <div class="mb-2">
                             <label class="form-label small mb-1">Kullanıcı Adı</label>
                             <input type="text" class="form-control form-control-sm" value="${email}" readonly>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1">SMS Doğrulama Telefonu</label>
+                            <input type="text" class="form-control form-control-sm ${telefon ? '' : 'is-invalid'}" value="${telefon || 'Tanımlı değil'}" readonly>
+                            ${telefon ? '' : '<div class="invalid-feedback">Telefon tanımlı değilse 2FA kodu gönderilemez.</div>'}
                         </div>
                         <div class="mb-2">
                             <label class="form-label small mb-1" for="gb_sifre">Yeni Şifre</label>
