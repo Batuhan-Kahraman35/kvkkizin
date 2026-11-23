@@ -4,13 +4,6 @@
  * Portal Örnek Yazılım
  */
 
-// Uygulama genel timezone standardi (tek merkez)
-if (!defined('APP_TIMEZONE')) {
-    define('APP_TIMEZONE', 'Europe/Istanbul');
-}
-
-date_default_timezone_set(APP_TIMEZONE);
-
 // session_start() oncesi DB erisimi gerekir: oturum omru tanim_site_ayarlari'ndan okunur
 require_once __DIR__ . '/db.php';
 
