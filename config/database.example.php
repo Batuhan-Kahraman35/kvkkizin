@@ -37,6 +37,17 @@ return [
         ],
     ],
     
+    // Şifreleme (includes/Sifreleme.php): bekleyen API başvuruları, webhook imza anahtarları.
+    // Anahtar üretmek için:  php -r "echo base64_encode(random_bytes(32));"
+    // Anahtar silinir veya değiştirilirse eski şifreli veriler çözülemez. Yenilemek için
+    // yeni sürüm numarasıyla ekleyip 'aktif' değerini değiştirin; eskisini silmeyin.
+    'sifreleme' => [
+        'aktif' => '1',
+        'anahtarlar' => [
+            '1' => 'BURAYA_32_BAYTLIK_BASE64_ANAHTAR',
+        ],
+    ],
+
     // Sunucu Bilgileri
     'server_info' => [
         'url' => 'ticari.example.com',

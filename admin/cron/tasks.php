@@ -19,11 +19,9 @@ require_once __DIR__ . '/../db.php';
 require_once __DIR__ . '/../includes/Bildirim.php';
 require_once __DIR__ . '/../includes/TicketApi.php';
 require_once __DIR__ . '/../includes/SmsApi.php';
+require_once __DIR__ . '/../../includes/Webhook.php';
 
-if (!defined('APP_TIMEZONE')) {
-    define('APP_TIMEZONE', 'Europe/Istanbul');
-}
-date_default_timezone_set(APP_TIMEZONE);
+// Saat dilimi sunucu php.ini'sinden gelir (date.timezone = Europe/Istanbul); burada ayarlanmaz.
 
 // ================================================================
 // Gizli anahtar — Entegrasyonlar (kod 'cron') → EntegrasyonKanallari
@@ -174,6 +172,8 @@ function gorevCalistir(string $gorevKodu, array $params, $db): array
         'destek_yaniti'      => 'gorevDestekYaniti',
         'log_temizle'        => 'gorevLogTemizle',
         'sms_kredi_guncelle' => 'gorevSmsKrediGuncelle',
+        'webhook_gonder'     => 'gorevWebhookGonder',
+        'api_temizle'        => 'gorevApiTemizle',
     ];
 
     if (!isset($eslesme[$gorevKodu])) {
@@ -399,6 +399,65 @@ function gorevLogTemizle(array $params, $db): array
     echo "SmsLog: süresi geçmiş $kodAdet doğrulama kodu temizlendi (kayıtlar korundu)\n";
 
     return ['durum' => 1, 'sonuc' => "$toplam kayıt silindi ($gun gün), $kodAdet kod temizlendi", 'cikti' => ob_get_clean()];
+}
+
+// ================================================================
+// GÖREV: webhook_gonder
+// Zamanı gelen webhook gönderimlerini imzalayıp yollar (ilk deneme + 1/10/60 dk tekrar).
+// Parametreler: limit (varsayılan 100), sure_sn (bu çalışmada en fazla süre, varsayılan 45)
+// ================================================================
+function gorevWebhookGonder(array $params, $db): array
+{
+    ob_start();
+    $limit = max(1, min(500, (int)($params['limit'] ?? 100)));
+    $sure  = max(10, min(55, (int)($params['sure_sn'] ?? 45)));
+
+    $r = Webhook::kuyruguIsle($limit, $sure);
+    foreach ($r['satirlar'] as $s) {
+        echo $s, "\n";
+    }
+
+    $ozet = "{$r['islenen']} gönderim: {$r['basarili']} başarılı, {$r['hatali']} hatalı"
+        . ($r['birakilan'] ? ", {$r['birakilan']} sonraki çalışmaya bırakıldı" : '');
+    // Müşteri adresinin hatası görevin hatası değildir; görev yalnız istisnada (dispatcher) hata döner
+    return ['durum' => 1, 'sonuc' => $ozet, 'cikti' => ob_get_clean()];
+}
+
+// ================================================================
+// GÖREV: api_temizle
+// - Api_Istek_Loglari ve sonuçlanmış Api_Webhook_Gonderimleri: api_log_gun'den eski
+// - Api_Bekleyen_Basvurular: kodu hiç girilmemiş ve süresi dolmuş kayıtlar (şifreli kişisel veri)
+//   Tamamlanmış bekleyen kayıtlar SİLİNMEZ: kanıttaki "cagiran_ip" bunlardan okunur.
+// ================================================================
+function gorevApiTemizle(array $params, $db): array
+{
+    ob_start();
+    $gun = Ayarlar::sayi('api_log_gun');
+    $parcaSil = function (string $tablo, string $kosul, array $p) use ($db): int {
+        $toplam = 0;
+        do {
+            $stmt = $db->query("DELETE TOP (5000) FROM dbo.$tablo WHERE $kosul", $p);
+            if ($stmt === false) {
+                throw new RuntimeException("$tablo temizlenemedi (SQL hatası, error_log'a yazıldı).");
+            }
+            $n = (int)sqlsrv_rows_affected($stmt);
+            sqlsrv_free_stmt($stmt);
+            $toplam += $n;
+        } while ($n === 5000);
+        return $toplam;
+    };
+
+    $log = $parcaSil('Api_Istek_Loglari', 'api_log_tarih < DATEADD(DAY, -?, GETDATE())', [$gun]);
+    echo "Api_Istek_Loglari: $gun günden eski $log kayıt silindi\n";
+
+    $gonderim = $parcaSil('Api_Webhook_Gonderimleri',
+        'OlusturmaTarihi < DATEADD(DAY, -?, GETDATE()) AND (gonderim_basarili_tarihi IS NOT NULL OR gonderim_sonraki_deneme IS NULL)', [$gun]);
+    echo "Api_Webhook_Gonderimleri: $gun günden eski $gonderim sonuçlanmış gönderim silindi\n";
+
+    $bekleyen = $parcaSil('Api_Bekleyen_Basvurular', 'bekleyen_basvuru_id IS NULL AND bekleyen_gecerlilik < GETDATE()', []);
+    echo "Api_Bekleyen_Basvurular: süresi dolan $bekleyen tamamlanmamış başvuru silindi\n";
+
+    return ['durum' => 1, 'sonuc' => "log $log, gönderim $gonderim, bekleyen $bekleyen silindi", 'cikti' => ob_get_clean()];
 }
 
 // ================================================================

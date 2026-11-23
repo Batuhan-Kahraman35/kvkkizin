@@ -15,6 +15,8 @@ require_once __DIR__ . '/../admin/db.php';
 require_once __DIR__ . '/../admin/includes/SmsApi.php';
 require_once __DIR__ . '/../admin/includes/TelefonHelper.php';
 require_once __DIR__ . '/OnayKanit.php';
+require_once __DIR__ . '/Ayarlar.php';
+require_once __DIR__ . '/Webhook.php';
 
 /** Müşteriye gösterilen onay metni kayıt anına kadar değişti */
 class MetinDegistiException extends Exception
@@ -23,13 +25,6 @@ class MetinDegistiException extends Exception
 
 class FormBasvuru
 {
-    const OTP_HANE            = 6;
-    const OTP_GECERLILIK_SN   = 300;   // 5 dakika
-    const OTP_MAX_DENEME      = 5;
-    const OTP_TEKRAR_SN       = 60;    // aynı başvuru için yeniden gönderim aralığı
-    const OTP_PENCERE_SN      = 600;   // sınır penceresi (10 dk)
-    const OTP_TELEFON_LIMIT   = 3;     // pencere içinde bir telefona en fazla
-    const OTP_IP_LIMIT        = 10;    // pencere içinde bir IP'den en fazla
     const SMS_AMAC            = 'form_dogrulama';
 
     /** Bu sürümde formda gösterilmeyen alanlar (firma bazlı metin / departman listesi gerekir) */
@@ -49,6 +44,24 @@ class FormBasvuru
     public function __construct()
     {
         $this->db = Database::getInstance();
+    }
+
+    /**
+     * SMS doğrulama ayarları (tanim_Ayarlar, firmaya özel değer varsa o).
+     * @return array hane, gecerlilik_sn, max_deneme, tekrar_sn, pencere_sn, telefon_limit, ip_limit
+     */
+    public static function otpAyarlari($firmaId)
+    {
+        $f = (int)$firmaId ?: null;
+        return [
+            'hane'          => Ayarlar::sayi('otp_hane', $f),
+            'gecerlilik_sn' => Ayarlar::sayi('otp_gecerlilik_sn', $f),
+            'max_deneme'    => Ayarlar::sayi('otp_max_deneme', $f),
+            'tekrar_sn'     => Ayarlar::sayi('otp_tekrar_sn', $f),
+            'pencere_sn'    => Ayarlar::sayi('otp_pencere_sn', $f),
+            'telefon_limit' => Ayarlar::sayi('otp_telefon_limit', $f),
+            'ip_limit'      => Ayarlar::sayi('otp_ip_limit', $f),
+        ];
     }
 
     /* ---------------------------------------------------------------------
@@ -356,18 +369,24 @@ class FormBasvuru
 
     /**
      * Doğrulama kodunu gönderir.
-     * @return array ['success', 'message', 'smslog_id']
+     * $api: API'den çağrıldığında ['anahtar_id' => int, 'tekrar' => bool]. Bu durumda IP sınırı yerine
+     *       anahtar sınırı uygulanır (entegratörün tüm istekleri tek sunucu IP'sinden gelir);
+     *       'tekrar' (kod yeniden gönderimi) anahtar sınırına sayılmaz, telefon sınırı her durumda geçerlidir.
+     * @return array ['success', 'message', 'smslog_id', 'kod' (hata: COK_FAZLA_ISTEK | SMS_GONDERILEMEDI)]
      */
-    public function kodGonder(array $form, $telefon)
+    public function kodGonder(array $form, $telefon, ?array $api = null)
     {
         $hesap = SmsApi::firmaHesabi((int)$form['firma_id']);
         if (!$hesap || (int)$hesap['operator_durum'] !== 1) {
             error_log('Form ' . $form['form_uniqid'] . ': firmanın aktif SMS hesabı yok (firma #' . $form['firma_id'] . ')');
-            return ['success' => false, 'message' => 'Doğrulama SMS\'i şu anda gönderilemiyor. Lütfen daha sonra tekrar deneyiniz.'];
+            return ['success' => false, 'kod' => 'SMS_GONDERILEMEDI', 'message' => 'Doğrulama SMS\'i şu anda gönderilemiyor. Lütfen daha sonra tekrar deneyiniz.'];
         }
 
-        // Kötüye kullanım sınırı (telefon ve IP)
-        $pencere = date('Y-m-d H:i:s', time() - self::OTP_PENCERE_SN);
+        $otp = self::otpAyarlari($form['firma_id']);
+        $limitMesaj = 'Çok fazla doğrulama isteği yapıldı. Lütfen ' . (int)ceil($otp['pencere_sn'] / 60) . ' dakika sonra tekrar deneyiniz.';
+
+        // Kötüye kullanım sınırı: telefon her zaman; web formunda IP, API'de anahtar
+        $pencere = date('Y-m-d H:i:s', time() - $otp['pencere_sn']);
         $say = $this->db->fetchOne("
             SELECT
                 SUM(CASE WHEN smslog_telefon = ? THEN 1 ELSE 0 END) AS telefon,
@@ -375,8 +394,18 @@ class FormBasvuru
             FROM dbo.SmsLog
             WHERE smslog_amac = ? AND smslog_gonderim_tarihi >= ?
         ", [$telefon, $_SERVER['REMOTE_ADDR'] ?? '', self::SMS_AMAC, $pencere]);
-        if ((int)($say['telefon'] ?? 0) >= self::OTP_TELEFON_LIMIT || (int)($say['ip'] ?? 0) >= self::OTP_IP_LIMIT) {
-            return ['success' => false, 'message' => 'Çok fazla doğrulama isteği yapıldı. Lütfen ' . (self::OTP_PENCERE_SN / 60) . ' dakika sonra tekrar deneyiniz.'];
+        if ((int)($say['telefon'] ?? 0) >= $otp['telefon_limit'] || (!$api && (int)($say['ip'] ?? 0) >= $otp['ip_limit'])) {
+            return ['success' => false, 'kod' => 'COK_FAZLA_ISTEK', 'message' => $limitMesaj];
+        }
+        if ($api && empty($api['tekrar'])) {
+            $anahtarSay = (int)($this->db->fetchOne("
+                SELECT COUNT(*) AS n FROM dbo.Api_Bekleyen_Basvurular
+                WHERE bekleyen_anahtar_id = ? AND bekleyen_smslog_id IS NOT NULL
+                  AND OlusturmaTarihi >= DATEADD(SECOND, -?, GETDATE())
+            ", [(int)$api['anahtar_id'], $otp['pencere_sn']])['n'] ?? 0);
+            if ($anahtarSay >= Ayarlar::sayi('otp_anahtar_limit', (int)$form['firma_id'])) {
+                return ['success' => false, 'kod' => 'COK_FAZLA_ISTEK', 'message' => 'Bu anahtar için kısa sürede çok fazla doğrulama SMS\'i istendi. Lütfen ' . (int)ceil($otp['pencere_sn'] / 60) . ' dakika sonra tekrar deneyiniz.'];
+            }
         }
 
         // Bu telefonun bu form için bekleyen eski kodları geçersizleşir
@@ -385,7 +414,7 @@ class FormBasvuru
             WHERE smslog_amac = ? AND smslog_telefon = ? AND smslog_firma_id = ? AND smslog_kod_kullanildi = 0
         ", [self::SMS_AMAC, $telefon, (int)$form['firma_id']]);
 
-        $kod = str_pad((string)random_int(0, (10 ** self::OTP_HANE) - 1), self::OTP_HANE, '0', STR_PAD_LEFT);
+        $kod = str_pad((string)random_int(0, (10 ** $otp['hane']) - 1), $otp['hane'], '0', STR_PAD_LEFT);
         $kok = self::kokAdres() . '/form/' . $form['form_uniqid'];
         $metinler = self::onayMetinleri($form);
 
@@ -402,12 +431,12 @@ class FormBasvuru
         $sonuc = SmsApi::otpGonder($hesap, $telefon, $mesaj, [
             'smslog_amac'       => self::SMS_AMAC,
             'smslog_kod_hash'   => password_hash($kod, PASSWORD_DEFAULT),
-            'smslog_gecerlilik' => date('Y-m-d H:i:s', time() + self::OTP_GECERLILIK_SN),
+            'smslog_gecerlilik' => date('Y-m-d H:i:s', time() + $otp['gecerlilik_sn']),
         ]);
 
         if (empty($sonuc['success']) || empty($sonuc['log_id'])) {
             error_log('Form ' . $form['form_uniqid'] . ' SMS gönderilemedi: ' . ($sonuc['message'] ?? ''));
-            return ['success' => false, 'message' => 'Doğrulama SMS\'i şu anda gönderilemedi. Lütfen birkaç dakika sonra tekrar deneyiniz.'];
+            return ['success' => false, 'kod' => 'SMS_GONDERILEMEDI', 'message' => 'Doğrulama SMS\'i şu anda gönderilemedi. Lütfen birkaç dakika sonra tekrar deneyiniz.'];
         }
         return ['success' => true, 'smslog_id' => (int)$sonuc['log_id'], 'message' => 'Doğrulama kodu gönderildi.'];
     }
@@ -419,7 +448,7 @@ class FormBasvuru
     public function kodDogrula($smslogId, $telefon, $girilen)
     {
         $kayit = $this->db->fetchOne("
-            SELECT smslog_id, smslog_kod_hash, smslog_gecerlilik, smslog_deneme, smslog_kod_kullanildi
+            SELECT smslog_id, smslog_firma_id, smslog_kod_hash, smslog_gecerlilik, smslog_deneme, smslog_kod_kullanildi
             FROM dbo.SmsLog WHERE smslog_id = ? AND smslog_amac = ? AND smslog_telefon = ?
         ", [(int)$smslogId, self::SMS_AMAC, $telefon]);
 
@@ -431,16 +460,18 @@ class FormBasvuru
             return ['success' => false, 'bitti' => true, 'message' => 'Kodun süresi doldu. Lütfen yeni kod isteyiniz.'];
         }
 
+        $maxDeneme = Ayarlar::sayi('otp_max_deneme', (int)$kayit['smslog_firma_id'] ?: null);
         $deneme = (int)$kayit['smslog_deneme'] + 1;
-        if (!preg_match('/^[0-9]{' . self::OTP_HANE . '}$/', $girilen) || !password_verify($girilen, $kayit['smslog_kod_hash'])) {
-            $tukendi = $deneme >= self::OTP_MAX_DENEME;
+        // Hane sayısı kod gönderildikten sonra değişmiş olabilir; doğruluğu hash karşılaştırması belirler
+        if (!preg_match('/^[0-9]{1,10}$/', $girilen) || !password_verify($girilen, $kayit['smslog_kod_hash'])) {
+            $tukendi = $deneme >= $maxDeneme;
             $this->db->execute("
                 UPDATE dbo.SmsLog SET smslog_deneme = ?, smslog_kod_kullanildi = ?, GuncellemeTarihi = GETDATE()
                 WHERE smslog_id = ?
             ", [$deneme, $tukendi ? 1 : 0, $kayit['smslog_id']]);
             return $tukendi
                 ? ['success' => false, 'bitti' => true, 'message' => 'Deneme hakkınız doldu. Lütfen yeni kod isteyiniz.']
-                : ['success' => false, 'bitti' => false, 'message' => 'Kod hatalı. Kalan deneme hakkı: ' . (self::OTP_MAX_DENEME - $deneme)];
+                : ['success' => false, 'bitti' => false, 'message' => 'Kod hatalı. Kalan deneme hakkı: ' . ($maxDeneme - $deneme)];
         }
 
         $this->db->execute("
@@ -468,9 +499,12 @@ class FormBasvuru
 
     /**
      * Başvuruyu yazar (tek transaction).
+     * $api: API'den gelen başvuruda ['anahtar_id', 'bekleyen_id', 'musteri_ip', 'musteri_tarayici'].
+     *       IP / tarayıcı kolonlarına müşterinin beyan edilen bilgisi yazılır (yoksa çağıran IP);
+     *       çağıran IP bekleyen kayıtta kalır ve kanıta eklenir (OnayKanit::veriUret).
      * @return int form_basvuru_id
      */
-    public function kaydet(array $form, array $veri, $smslogId = null)
+    public function kaydet(array $form, array $veri, $smslogId = null, ?array $api = null)
     {
         // Kayıt anındaki metinler müşteriye gösterilenlerle aynı olmalı
         $metinler = self::onayMetinleri($form);
@@ -500,12 +534,18 @@ class FormBasvuru
         $conn = $this->db->getConnection();
         sqlsrv_begin_transaction($conn);
         try {
+            $yenilenenler = [];
             if ($b['telefon']) {
-                $this->sorgu("
+                $stmt = $this->sorgu("
                     UPDATE dbo.Form_Basvurulari
                     SET form_basvuru_dogrulama_durumu = ?, form_basvuru_guncelleme_tarihi = ?
+                    OUTPUT INSERTED.form_basvuru_id
                     WHERE form_id = ? AND form_basvuru_telefon = ? AND form_basvuru_dogrulama_durumu = ?
                 ", [$yenilendi, $simdi, (int)$form['form_id'], $b['telefon'], $onaylandi]);
+                while ($r = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_NUMERIC)) {
+                    $yenilenenler[] = (int)$r[0];
+                }
+                sqlsrv_free_stmt($stmt);
             }
 
             $stmt = $this->sorgu("
@@ -513,21 +553,38 @@ class FormBasvuru
                     (form_id, firma_id, form_basvuru_ad, form_basvuru_soyad, form_basvuru_telefon, form_basvuru_eposta,
                      form_basvuru_aydinlatma_onay, form_basvuru_acik_riza_onay, form_basvuru_etk_onay, form_basvuru_gps_onay,
                      form_basvuru_kvkk_onay, form_basvuru_dogrulama_durumu, form_basvuru_sms_referans, form_basvuru_sms_dogrulama_tarihi,
-                     form_basvuru_ip_adresi, form_basvuru_tarayici, form_basvuru_tarihi, form_basvuru_durum, form_basvuru_olusturma_tarihi)
+                     form_basvuru_ip_adresi, form_basvuru_tarayici, form_basvuru_tarihi, form_basvuru_durum, form_basvuru_olusturma_tarihi,
+                     form_basvuru_api_anahtar_id)
                 OUTPUT INSERTED.form_basvuru_id
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             ", [
                 (int)$form['form_id'], (int)$form['firma_id'], $b['ad'], $b['soyad'], $b['telefon'], $b['eposta'],
                 (int)($o['form_basvuru_aydinlatma_onay'] ?? 0), (int)($o['form_basvuru_acik_riza_onay'] ?? 0),
                 (int)($o['form_basvuru_etk_onay'] ?? 0), (int)($o['form_basvuru_gps_onay'] ?? 0),
                 $kvkk, $onaylandi, $smslogId ? (string)$smslogId : null, $smslogId ? $simdi : null,
-                mb_substr((string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45),
-                mb_substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 500) ?: null,
+                mb_substr((string)($api['musteri_ip'] ?? '') ?: (string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45),
+                $api ? (mb_substr((string)($api['musteri_tarayici'] ?? ''), 0, 500) ?: null)
+                     : (mb_substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 500) ?: null),
                 $simdi, $simdi,
+                $api ? (int)$api['anahtar_id'] : null,
             ]);
             $row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_NUMERIC);
             sqlsrv_free_stmt($stmt);
             $basvuruId = (int)$row[0];
+
+            // API: bekleyen kaydı tamamlanır (şifreli veri silinir). Aynı doğrulama iki kez kaydedilemez.
+            if ($api) {
+                $stmt = $this->sorgu("
+                    UPDATE dbo.Api_Bekleyen_Basvurular
+                    SET bekleyen_basvuru_id = ?, bekleyen_veri = NULL, GuncellemeTarihi = GETDATE()
+                    WHERE bekleyen_id = ? AND bekleyen_basvuru_id IS NULL
+                ", [$basvuruId, (int)$api['bekleyen_id']]);
+                $etkilenen = sqlsrv_rows_affected($stmt);
+                sqlsrv_free_stmt($stmt);
+                if ($etkilenen !== 1) {
+                    throw new Exception('Bekleyen başvuru zaten tamamlanmış (#' . (int)$api['bekleyen_id'] . ').');
+                }
+            }
 
             if ($veri['degerler']) {
                 $parametre = [];
@@ -573,11 +630,18 @@ class FormBasvuru
             ", [OnayKanit::SURUM, $kanit, OnayKanit::metinHash($kanit), $basvuruId]));
 
             sqlsrv_commit($conn);
-            return $basvuruId;
         } catch (Throwable $e) {
             sqlsrv_rollback($conn);
             throw $e;
         }
+
+        // Bildirim: önceki onaylı kayıt yenilendiyse basvuru.yenilendi, yoksa basvuru.onaylandi (tek olay)
+        sort($yenilenenler);
+        Webhook::olay($yenilenenler ? 'basvuru.yenilendi' : 'basvuru.onaylandi', (int)$form['firma_id'], $basvuruId,
+            ['form' => $form['form_uniqid'], 'durum' => 'onaylandi', 'kaynak' => $api ? 'api' : 'form']
+            + ($yenilenenler ? ['onceki_basvuru_idleri' => $yenilenenler] : []));
+
+        return $basvuruId;
     }
 
     /** Tek satır tek kolon döndüren sorgu (yoksa null) */

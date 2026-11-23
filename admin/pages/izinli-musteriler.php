@@ -5,11 +5,16 @@
  * Genel formlardan (form/{uniqid}) gelen başvuruları ve verilen izinleri
  * (Aydınlatma, Açık Rıza, KVKK, ETK, GPS) listeler. Kaynak: Form_Basvurulari.
  * Hareket tablosu olduğu için liste server-side ve iki aşamalı sorguyla kurulur.
+ *
+ * İptal (API veya panel): onay kolonları DEĞİŞTİRİLMEZ (kanıt onlardan üretilir). Kayıt dogrulama_durumu = 'iptal'
+ * ve Form_Basvuru_Iptalleri satırıyla işaretlenir; ekranda açık rıza / KVKK / ETK geri alınmış (0) gösterilir.
+ * Kaynak: API (form_basvuru_api_anahtar_id dolu) · Excel (durum 'excel') · Form (diğerleri).
  */
 
 require_once __DIR__ . '/../auth.php';
 require_once __DIR__ . '/../includes/PageAuth.php';
 require_once __DIR__ . '/../../includes/OnayKanit.php';
+require_once __DIR__ . '/../../includes/Webhook.php';
 requireAuth();
 
 $user = Auth::user();
@@ -43,6 +48,17 @@ $tarihGecerli = function ($tarih) {
     return $d && $d->format('Y-m-d') === $tarih;
 };
 
+/** Kaydın aktif iptali var mı (b alias'ı üzerinden) */
+const IPTAL_VAR = 'EXISTS (SELECT 1 FROM dbo.Form_Basvuru_Iptalleri ix WHERE ix.iptal_form_basvuru_id = b.form_basvuru_id AND ix.Durum = 1)';
+/** Excel ile yüklenen kayıtların durum id'leri */
+const EXCEL_DURUM = "(SELECT form_dogrulama_durum_id FROM dbo.tanim_FormDogrulamaDurumlari WHERE form_dogrulama_durum_kod = 'excel')";
+
+/** Kaynak ifadesi (b + d alias'ları) */
+const KAYNAK_SQL = "CASE WHEN b.form_basvuru_api_anahtar_id IS NOT NULL THEN 'api' WHEN d.form_dogrulama_durum_kod = 'excel' THEN 'excel' ELSE 'form' END";
+
+/** İptalde geri alınan izinler için ekranda gösterilecek değer (i = Form_Basvuru_Iptalleri LEFT JOIN) */
+$etkinIzin = fn($kolon) => "CASE WHEN i.iptal_id IS NOT NULL AND $kolon IS NOT NULL THEN 0 ELSE $kolon END";
+
 /**
  * Liste / özet / Excel filtreleri — yalnız Form_Basvurulari (b) üzerinden, JOIN'siz
  */
@@ -57,12 +73,30 @@ $filtreOlustur = function (array $girdi) use ($firmaScopeIds, $tarihGecerli) {
         }
     }
 
-    // İzin filtreleri (1 = verildi, 0 = verilmedi)
-    foreach (['etk' => 'b.form_basvuru_etk_onay', 'gps' => 'b.form_basvuru_gps_onay', 'kvkk' => 'b.form_basvuru_kvkk_onay'] as $alan => $kolon) {
+    // İzin filtreleri (1 = verildi, 0 = verilmedi). İptalde geri alınan izinler (KVKK, ETK) verilmedi sayılır.
+    foreach (['etk' => ['b.form_basvuru_etk_onay', true], 'gps' => ['b.form_basvuru_gps_onay', false], 'kvkk' => ['b.form_basvuru_kvkk_onay', true]] as $alan => [$kolon, $iptaldeGeriAlinir]) {
         if (isset($girdi[$alan]) && in_array((string)$girdi[$alan], ['0', '1'], true)) {
-            $kosullar[] = "$kolon = ?";
-            $params[] = (int)$girdi[$alan];
+            if (!$iptaldeGeriAlinir) {
+                $kosullar[] = "$kolon = ?";
+                $params[] = (int)$girdi[$alan];
+            } elseif ($girdi[$alan] === '1') {
+                $kosullar[] = "$kolon = 1 AND NOT " . IPTAL_VAR;
+            } else {
+                $kosullar[] = "($kolon = 0 OR ($kolon IS NOT NULL AND " . IPTAL_VAR . '))';
+            }
         }
+    }
+
+    switch ($girdi['kaynak'] ?? '') {
+        case 'api':
+            $kosullar[] = 'b.form_basvuru_api_anahtar_id IS NOT NULL';
+            break;
+        case 'excel':
+            $kosullar[] = 'b.form_basvuru_api_anahtar_id IS NULL AND b.form_basvuru_dogrulama_durumu IN ' . EXCEL_DURUM;
+            break;
+        case 'form':
+            $kosullar[] = 'b.form_basvuru_api_anahtar_id IS NULL AND (b.form_basvuru_dogrulama_durumu IS NULL OR b.form_basvuru_dogrulama_durumu NOT IN ' . EXCEL_DURUM . ')';
+            break;
     }
 
     if (!empty($girdi['tarih_bas']) && $tarihGecerli($girdi['tarih_bas'])) {
@@ -103,16 +137,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
     $satirlar = $db->fetchAll("
         SELECT b.form_basvuru_id, fi.firma_adi, f.form_adi,
                b.form_basvuru_ad, b.form_basvuru_soyad, b.form_basvuru_telefon, b.form_basvuru_eposta,
-               b.form_basvuru_aydinlatma_onay, b.form_basvuru_acik_riza_onay, b.form_basvuru_kvkk_onay,
-               b.form_basvuru_etk_onay, b.form_basvuru_gps_onay,
-               d.form_dogrulama_durum_adi,
+               b.form_basvuru_aydinlatma_onay,
+               " . $etkinIzin('b.form_basvuru_acik_riza_onay') . " AS form_basvuru_acik_riza_onay,
+               " . $etkinIzin('b.form_basvuru_kvkk_onay') . " AS form_basvuru_kvkk_onay,
+               " . $etkinIzin('b.form_basvuru_etk_onay') . " AS form_basvuru_etk_onay,
+               b.form_basvuru_gps_onay,
+               d.form_dogrulama_durum_adi, " . KAYNAK_SQL . " AS kaynak,
                CONVERT(VARCHAR(19), b.form_basvuru_sms_dogrulama_tarihi, 120) AS sms_tarih,
                b.form_basvuru_ip_adresi,
-               CONVERT(VARCHAR(19), b.form_basvuru_tarihi, 120) AS tarih
+               CONVERT(VARCHAR(19), b.form_basvuru_tarihi, 120) AS tarih,
+               CONVERT(VARCHAR(19), i.OlusturmaTarihi, 120) AS iptal_tarih, i.iptal_neden
         FROM dbo.Form_Basvurulari b
         LEFT JOIN dbo.Formlar f ON f.form_id = b.form_id
         LEFT JOIN dbo.Firmalar fi ON fi.firma_id = b.firma_id
         LEFT JOIN dbo.tanim_FormDogrulamaDurumlari d ON d.form_dogrulama_durum_id = b.form_basvuru_dogrulama_durumu
+        LEFT JOIN dbo.Form_Basvuru_Iptalleri i ON i.iptal_form_basvuru_id = b.form_basvuru_id AND i.Durum = 1
         WHERE $filtreSql
         ORDER BY b.form_basvuru_tarihi DESC, b.form_basvuru_id DESC
     ", $filtreParams) ?: [];
@@ -125,6 +164,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
         return htmlspecialchars($v, ENT_QUOTES, 'UTF-8');
     };
     $evet = fn($v) => $v === null ? '-' : ((int)$v === 1 ? 'Evet' : 'Hayır');
+    $kaynakAdi = ['api' => 'API', 'excel' => 'Excel', 'form' => 'Form'];
 
     header('Content-Type: application/vnd.ms-excel; charset=UTF-8');
     header('Content-Disposition: attachment; filename="izinli_musteriler_' . date('Y-m-d_H-i-s') . '.xls"');
@@ -134,7 +174,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
     echo '<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta http-equiv="content-type" content="application/vnd.ms-excel; charset=UTF-8">';
     echo '<style>td{mso-number-format:"\@";}</style></head><body><table border="1">';
     echo '<tr style="background-color:#0d6efd;color:#fff;font-weight:bold;">';
-    foreach (['ID', 'Firma', 'Form', 'Ad', 'Soyad', 'Cep Telefonu', 'E-posta', 'Aydınlatma', 'Açık Rıza', 'KVKK', 'ETK', 'GPS', 'Doğrulama', 'SMS Doğrulama Tarihi', 'IP Adresi', 'Başvuru Tarihi'] as $b) {
+    foreach (['ID', 'Firma', 'Form', 'Ad', 'Soyad', 'Cep Telefonu', 'E-posta', 'Aydınlatma', 'Açık Rıza', 'KVKK', 'ETK', 'GPS', 'Doğrulama', 'Kaynak', 'SMS Doğrulama Tarihi', 'IP Adresi', 'Başvuru Tarihi', 'İptal Tarihi', 'İptal Nedeni'] as $b) {
         echo '<th>' . $b . '</th>';
     }
     echo '</tr>';
@@ -153,9 +193,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'excel
             . '<td>' . $evet($r['form_basvuru_etk_onay']) . '</td>'
             . '<td>' . $evet($r['form_basvuru_gps_onay']) . '</td>'
             . '<td>' . $h($r['form_dogrulama_durum_adi']) . '</td>'
+            . '<td>' . $h($kaynakAdi[$r['kaynak']] ?? $r['kaynak']) . '</td>'
             . '<td>' . $h($r['sms_tarih']) . '</td>'
             . '<td>' . $h($r['form_basvuru_ip_adresi']) . '</td>'
             . '<td>' . $h($r['tarih']) . '</td>'
+            . '<td>' . $h($r['iptal_tarih']) . '</td>'
+            . '<td>' . $h($r['iptal_neden']) . '</td>'
             . '</tr>';
     }
     echo '</table></body></html>';
@@ -229,20 +272,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         b.form_basvuru_ad AS ad,
                         b.form_basvuru_soyad AS soyad,
                         b.form_basvuru_telefon AS telefon,
-                        b.form_basvuru_etk_onay AS etk,
+                        " . $etkinIzin('b.form_basvuru_etk_onay') . " AS etk,
                         b.form_basvuru_gps_onay AS gps,
-                        b.form_basvuru_kvkk_onay AS kvkk,
+                        " . $etkinIzin('b.form_basvuru_kvkk_onay') . " AS kvkk,
                         b.form_basvuru_durum AS durum,
                         CONVERT(VARCHAR(19), b.form_basvuru_tarihi, 120) AS tarih,
                         f.form_adi, f.form_uniqid,
                         fi.firma_adi,
                         d.form_dogrulama_durum_adi AS dogrulama_adi,
-                        d.form_dogrulama_durum_renk AS dogrulama_renk
+                        d.form_dogrulama_durum_renk AS dogrulama_renk,
+                        d.form_dogrulama_durum_gecerli AS gecerli,
+                        " . KAYNAK_SQL . " AS kaynak,
+                        CASE WHEN i.iptal_id IS NULL THEN 0 ELSE 1 END AS iptal
                     FROM Sayfa p
                     INNER JOIN dbo.Form_Basvurulari b ON b.form_basvuru_id = p.form_basvuru_id
                     LEFT JOIN dbo.Formlar f ON f.form_id = b.form_id
                     LEFT JOIN dbo.Firmalar fi ON fi.firma_id = b.firma_id
                     LEFT JOIN dbo.tanim_FormDogrulamaDurumlari d ON d.form_dogrulama_durum_id = b.form_basvuru_dogrulama_durumu
+                    LEFT JOIN dbo.Form_Basvuru_Iptalleri i ON i.iptal_form_basvuru_id = b.form_basvuru_id AND i.Durum = 1
                     ORDER BY p.sira
                 ", array_merge($filtreParams, [$start, $length]));
 
@@ -255,19 +302,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 break;
 
             case 'stats':
-                // Filtrelerle birlikte çalışır
+                // Filtrelerle birlikte çalışır. İzin sayaçları yalnız güncel kayıtlar (onaylandı + Excel):
+                // yenilenen (aynı kişinin eski kaydı), iptal edilen ve doğrulama bekleyen kayıtlar sayılmaz.
                 [$filtreSql, $filtreParams] = $filtreOlustur($_POST);
+                // SUM içinde alt sorgu kullanılamadığı için durum tanımı (küçük tanım tablosu) JOIN ile alınır
+                $guncel = "(d.form_dogrulama_durum_gecerli = 1 OR d.form_dogrulama_durum_kod = 'excel')";
                 $ozet = $db->fetchOne("
                     SELECT
                         COUNT(*) AS toplam,
                         SUM(CASE WHEN b.form_basvuru_tarihi >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1) THEN 1 ELSE 0 END) AS bu_ay,
-                        SUM(CASE WHEN b.form_basvuru_dogrulama_durumu IN (
-                                SELECT form_dogrulama_durum_id FROM dbo.tanim_FormDogrulamaDurumlari WHERE form_dogrulama_durum_gecerli = 1
-                            ) THEN 1 ELSE 0 END) AS gecerli,
-                        SUM(CASE WHEN b.form_basvuru_kvkk_onay = 1 THEN 1 ELSE 0 END) AS kvkk,
-                        SUM(CASE WHEN b.form_basvuru_etk_onay = 1 THEN 1 ELSE 0 END) AS etk,
-                        SUM(CASE WHEN b.form_basvuru_gps_onay = 1 THEN 1 ELSE 0 END) AS gps
+                        SUM(CASE WHEN d.form_dogrulama_durum_gecerli = 1 THEN 1 ELSE 0 END) AS gecerli,
+                        SUM(CASE WHEN $guncel AND b.form_basvuru_kvkk_onay = 1 THEN 1 ELSE 0 END) AS kvkk,
+                        SUM(CASE WHEN $guncel AND b.form_basvuru_etk_onay = 1 THEN 1 ELSE 0 END) AS etk,
+                        SUM(CASE WHEN $guncel AND b.form_basvuru_gps_onay = 1 THEN 1 ELSE 0 END) AS gps
                     FROM dbo.Form_Basvurulari b
+                    LEFT JOIN dbo.tanim_FormDogrulamaDurumlari d ON d.form_dogrulama_durum_id = b.form_basvuru_dogrulama_durumu
                     WHERE $filtreSql
                 ", $filtreParams);
                 echo json_encode(['success' => true, 'data' => array_map('intval', $ozet ?: [])], JSON_UNESCAPED_UNICODE);
@@ -323,17 +372,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                            CONVERT(VARCHAR(19), b.form_basvuru_tarihi, 120) AS tarih,
                            CONVERT(VARCHAR(19), b.form_basvuru_sms_dogrulama_tarihi, 120) AS sms_tarih,
                            f.form_adi, fi.firma_adi,
-                           d.form_dogrulama_durum_adi AS dogrulama_adi, d.form_dogrulama_durum_renk AS dogrulama_renk
+                           d.form_dogrulama_durum_adi AS dogrulama_adi, d.form_dogrulama_durum_renk AS dogrulama_renk,
+                           d.form_dogrulama_durum_gecerli AS gecerli, " . KAYNAK_SQL . " AS kaynak,
+                           i.iptal_id, i.iptal_neden, i.iptal_ip, i.iptal_musteri_ip,
+                           CONVERT(VARCHAR(19), i.OlusturmaTarihi, 120) AS iptal_tarih,
+                           a.api_anahtar_on_ek AS iptal_anahtar, a.api_anahtar_adi AS iptal_anahtar_adi,
+                           LTRIM(RTRIM(ISNULL(k.kullanici_ad, '') + ' ' + ISNULL(k.kullanici_soyad, ''))) AS iptal_kullanici
                     FROM dbo.Form_Basvurulari b
                     LEFT JOIN dbo.Formlar f ON f.form_id = b.form_id
                     LEFT JOIN dbo.Firmalar fi ON fi.firma_id = b.firma_id
                     LEFT JOIN dbo.tanim_FormDogrulamaDurumlari d ON d.form_dogrulama_durum_id = b.form_basvuru_dogrulama_durumu
+                    LEFT JOIN dbo.Form_Basvuru_Iptalleri i ON i.iptal_form_basvuru_id = b.form_basvuru_id AND i.Durum = 1
+                    LEFT JOIN dbo.Api_Anahtarlari a ON a.api_anahtar_id = i.iptal_api_anahtar_id
+                    LEFT JOIN dbo.Kullanicilar k ON k.kullanici_id = i.OlusturanKullanici
                     WHERE b.form_basvuru_id = ? AND $scopeSql
                 ", array_merge([$id], $scopeParams));
 
                 if (!$kayit) {
                     echo json_encode(['success' => false, 'message' => 'Kayıt bulunamadı'], JSON_UNESCAPED_UNICODE);
                     break;
+                }
+
+                // İptalde geri alınan izinler: ekranda 0, ilk verilen hali 'verilen' altında
+                $kayit['verilen'] = null;
+                if ($kayit['iptal_id'] !== null) {
+                    $kayit['verilen'] = ['acik_riza' => $kayit['acik_riza'], 'kvkk' => $kayit['kvkk'], 'etk' => $kayit['etk']];
+                    foreach (['acik_riza', 'kvkk', 'etk'] as $k) {
+                        if ($kayit[$k] !== null) {
+                            $kayit[$k] = 0;
+                        }
+                    }
                 }
 
                 $kayit['alanlar'] = $db->fetchAll("
@@ -418,6 +486,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'form_basvuru_guncelleme_tarihi'        => date('Y-m-d H:i:s'),
                 ], ['form_basvuru_id' => $id]);
                 echo json_encode(['success' => true, 'message' => $yeni ? 'Kayıt aktif edildi' : 'Kayıt pasife alındı'], JSON_UNESCAPED_UNICODE);
+                break;
+
+            case 'iptal':
+                // Müşterinin izni geri çekmesi: API iptaliyle aynı kayıt, anahtar yerine kullanıcı
+                if (!$permissions['can_delete']) {
+                    echo json_encode(['success' => false, 'message' => 'İptal yetkiniz yok'], JSON_UNESCAPED_UNICODE);
+                    break;
+                }
+                $id = (int)($_POST['form_basvuru_id'] ?? 0);
+                $neden = trim(preg_replace('/\s+/u', ' ', (string)($_POST['neden'] ?? '')));
+                if ($neden === '' || mb_strlen($neden) > 500) {
+                    echo json_encode(['success' => false, 'message' => 'İptal nedeni zorunlu (en fazla 500 karakter)'], JSON_UNESCAPED_UNICODE);
+                    break;
+                }
+                [$scopeSql, $scopeParams] = PageAuth::firmaScopeWhere($firmaScopeIds, 'b.firma_id');
+
+                $conn = $db->getConnection();
+                sqlsrv_begin_transaction($conn);
+                try {
+                    $b = $db->fetchOne("
+                        SELECT b.form_basvuru_id, b.firma_id, f.form_uniqid,
+                               d.form_dogrulama_durum_gecerli AS gecerli, d.form_dogrulama_durum_adi AS durum_adi
+                        FROM dbo.Form_Basvurulari b WITH (UPDLOCK, HOLDLOCK)
+                        INNER JOIN dbo.Formlar f ON f.form_id = b.form_id
+                        LEFT JOIN dbo.tanim_FormDogrulamaDurumlari d ON d.form_dogrulama_durum_id = b.form_basvuru_dogrulama_durumu
+                        WHERE b.form_basvuru_id = ? AND $scopeSql
+                    ", array_merge([$id], $scopeParams));
+                    if (!$b) {
+                        throw new RuntimeException('Kayıt bulunamadı');
+                    }
+                    if ((int)$b['gecerli'] !== 1) {
+                        throw new RuntimeException('Yalnız geçerli (onaylanmış) kayıt iptal edilebilir; bu kaydın durumu: ' . $b['durum_adi']);
+                    }
+                    $iptalDurum = $db->fetchOne("
+                        SELECT form_dogrulama_durum_id FROM dbo.tanim_FormDogrulamaDurumlari
+                        WHERE form_dogrulama_durum_kod = 'iptal' AND form_dogrulama_durum_durum = 1
+                    ");
+                    if (!$iptalDurum) {
+                        throw new Exception("tanim_FormDogrulamaDurumlari içinde 'iptal' tanımı yok.");
+                    }
+                    $ok = $db->execute("
+                        INSERT INTO dbo.Form_Basvuru_Iptalleri (iptal_form_basvuru_id, iptal_neden, iptal_api_anahtar_id, iptal_ip, OlusturanKullanici)
+                        VALUES (?, ?, NULL, ?, ?)
+                    ", [$id, $neden, mb_substr((string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45), (int)$user['kullanici_id']])
+                        && $db->execute("
+                        UPDATE dbo.Form_Basvurulari
+                        SET form_basvuru_dogrulama_durumu = ?, form_basvuru_guncelleyen_kullanici_id = ?, form_basvuru_guncelleme_tarihi = GETDATE()
+                        WHERE form_basvuru_id = ?
+                    ", [(int)$iptalDurum['form_dogrulama_durum_id'], (int)$user['kullanici_id'], $id]);
+                    if (!$ok) {
+                        throw new Exception('İptal kaydı yazılamadı (#' . $id . ').');
+                    }
+                    sqlsrv_commit($conn);
+                } catch (RuntimeException $e) {
+                    sqlsrv_rollback($conn);
+                    echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+                    break;
+                } catch (Throwable $e) {
+                    sqlsrv_rollback($conn);
+                    throw $e;
+                }
+
+                $bildirim = Webhook::olay('basvuru.iptal_edildi', (int)$b['firma_id'], $id,
+                    ['form' => $b['form_uniqid'], 'durum' => 'iptal', 'kaynak' => 'panel']);
+                echo json_encode(['success' => true, 'message' => 'Kayıt iptal edildi' . ($bildirim ? " ($bildirim bildirim kuyruğa alındı)" : '')], JSON_UNESCAPED_UNICODE);
                 break;
 
             default:
@@ -585,6 +718,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         </select>
                                     </div>
                                     <div class="col-md-2">
+                                        <label class="form-label">Kaynak</label>
+                                        <select class="form-select select2-filter" id="filter_kaynak" style="width: 100%;">
+                                            <option value="">Tümü</option>
+                                            <option value="form">Form</option>
+                                            <option value="api">API</option>
+                                            <option value="excel">Excel</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-2">
                                         <label class="form-label">Başlangıç Tarihi</label>
                                         <input type="date" class="form-control" id="filter_tarih_bas">
                                     </div>
@@ -632,6 +774,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <th>Cep Telefonu</th>
                                         <th>Firma</th>
                                         <th>Doğrulama</th>
+                                        <th>Kaynak</th>
                                         <th class="text-center">İşlem</th>
                                     </tr>
                                 </thead>
@@ -680,7 +823,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         const TEK_FIRMA = <?= $tekFirma ? 'true' : 'false' ?>;
         const permissions = {
-            canEdit: <?= $permissions['can_edit'] ? 'true' : 'false' ?>
+            canEdit: <?= $permissions['can_edit'] ? 'true' : 'false' ?>,
+            canDelete: <?= $permissions['can_delete'] ? 'true' : 'false' ?>
+        };
+        const KAYNAK = {
+            api:   '<span class="badge text-bg-info"><i class="bi bi-plug me-1"></i>API</span>',
+            excel: '<span class="badge text-bg-secondary"><i class="bi bi-file-earmark-excel me-1"></i>Excel</span>',
+            form:  '<span class="badge text-bg-light border"><i class="bi bi-ui-checks me-1"></i>Form</span>'
         };
 
         function escapeHtml(text) {
@@ -765,6 +914,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     { data: 'firma_adi', visible: !TEK_FIRMA, render: v => `<small>${escapeHtml(v || '-')}</small>` },
                     { data: 'dogrulama_adi', render: (v, t, r) =>
                         `<span class="badge text-bg-${escapeHtml(r.dogrulama_renk || 'secondary')}">${escapeHtml(v || '-')}</span>` },
+                    { data: 'kaynak', orderable: false, className: 'text-nowrap', render: v => KAYNAK[v] || escapeHtml(v || '-') },
                     { data: null, orderable: false, className: 'text-center text-nowrap', render: function(v, t, r) {
                         let menu = `<li><a class="dropdown-item" href="#" onclick="detayGoster(${r.form_basvuru_id}); return false;"><i class="bi bi-eye me-2"></i>Detay</a></li>`;
                         if (r.telefon) {
@@ -774,6 +924,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             menu += '<li><hr class="dropdown-divider"></li>' + (r.durum == 1
                                 ? `<li><a class="dropdown-item text-danger" href="#" onclick="durumDegistir(${r.form_basvuru_id}, 0); return false;"><i class="bi bi-eye-slash me-2"></i>Pasife Al</a></li>`
                                 : `<li><a class="dropdown-item text-success" href="#" onclick="durumDegistir(${r.form_basvuru_id}, 1); return false;"><i class="bi bi-eye me-2"></i>Aktif Et</a></li>`);
+                        }
+                        if (permissions.canDelete && r.gecerli == 1) {
+                            const etiket = ((r.ad || '') + ' ' + (r.soyad || '')).trim() || r.telefon || ('#' + r.form_basvuru_id);
+                            menu += `<li><a class="dropdown-item text-danger" href="#" onclick="iptalEt(${r.form_basvuru_id}, ${escapeHtml(JSON.stringify(etiket))}); return false;"><i class="bi bi-x-octagon me-2"></i>İzni İptal Et</a></li>`;
                         }
                         return `<div class="btn-group">
                                     <button type="button" class="btn btn-sm btn-primary" onclick="detayGoster(${r.form_basvuru_id})">İşlem</button>
@@ -808,6 +962,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     etk: $('#filter_etk').val(),
                     gps: $('#filter_gps').val(),
                     kvkk: $('#filter_kvkk').val(),
+                    kaynak: $('#filter_kaynak').val(),
                     tarih_bas: $('#filter_tarih_bas').val(),
                     tarih_bit: $('#filter_tarih_bit').val(),
                     status: durum === 'hepsi' ? 'hepsi' : durum
@@ -894,13 +1049,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }, 'json');
         }
 
-        function izinSatir(baslik, v) {
+        // ilk: iptalde ilk verilen değer (geri alındıysa "iptalle geri alındı" notu)
+        function izinSatir(baslik, v, ilk) {
             let deger;
             if (v === null || v === undefined || v === '') deger = '<span class="text-muted">Formda yok</span>';
+            else if (ilk == 1 && v == 0) deger = '<span class="text-danger"><i class="bi bi-arrow-counterclockwise me-1"></i>Geri alındı</span> <small class="text-muted">(iptalle)</small>';
             else deger = v == 1
                 ? '<span class="text-success"><i class="bi bi-check-circle me-1"></i>Verildi</span>'
                 : '<span class="text-danger"><i class="bi bi-x-circle me-1"></i>Verilmedi</span>';
             return `<tr><th>${baslik}</th><td>${deger}</td></tr>`;
+        }
+
+        function iptalHtml(d) {
+            if (!d.iptal_id) return '';
+            const kim = d.iptal_anahtar
+                ? `API · <span class="font-monospace">${escapeHtml(d.iptal_anahtar)}…</span> ${escapeHtml(d.iptal_anahtar_adi || '')}`
+                : `Panel · ${escapeHtml(d.iptal_kullanici || '-')}`;
+            return `<div class="alert alert-danger mt-2 mb-3">
+                <h6 class="alert-heading mb-2"><i class="bi bi-x-octagon me-1"></i>İzin İptal Edildi</h6>
+                <table class="table table-sm table-borderless mb-0 small detay-tablo"><tbody>
+                    <tr><th>Tarih</th><td>${escapeHtml(formatZaman(d.iptal_tarih))}</td></tr>
+                    <tr><th>Neden</th><td>${escapeHtml(d.iptal_neden)}</td></tr>
+                    <tr><th>Yapan</th><td>${kim}</td></tr>
+                    <tr><th>IP</th><td>${escapeHtml(d.iptal_ip || '-')}${d.iptal_musteri_ip ? ` <small class="text-muted">(müşteri: ${escapeHtml(d.iptal_musteri_ip)})</small>` : ''}</td></tr>
+                </tbody></table>
+                <div class="small mt-2">Açık rıza, KVKK ve ETK izinleri geri alınmış sayılır. Onay kanıtı değişmeden korunur.</div>
+            </div>`;
+        }
+
+        function iptalEt(id, etiket) {
+            Swal.fire({
+                title: 'İzin iptal edilsin mi?',
+                html: `<div class="text-start small mb-2"><b>${escapeHtml(etiket)}</b> kaydının açık rıza, KVKK ve ETK izinleri geri alınmış sayılır.
+                       Bu işlem <b>geri alınamaz</b>; firmanın bildirim adresine "iptal edildi" bildirimi gönderilir.</div>`,
+                input: 'textarea',
+                inputLabel: 'İptal nedeni',
+                inputPlaceholder: 'Örn. Müşteri telefonla izni geri çekti',
+                inputAttributes: { maxlength: 500 },
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonText: 'İptal Et',
+                cancelButtonText: 'Vazgeç',
+                confirmButtonColor: '#dc3545',
+                inputValidator: v => (!v || !v.trim()) ? 'İptal nedeni zorunludur' : undefined
+            }).then(res => {
+                if (!res.isConfirmed) return;
+                $.post('', { action: 'iptal', form_basvuru_id: id, neden: res.value.trim() }, function(r) {
+                    showToast(r.message, r.success ? 'success' : 'error');
+                    if (r.success) listeYenile(true);
+                }, 'json').fail(() => showToast('Sunucuya ulaşılamadı', 'error'));
+            });
         }
 
         function detayGoster(id) {
@@ -946,6 +1144,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <tr><th>Cep Telefonu</th><td>${escapeHtml(d.telefon || '-')}</td></tr>
                                     <tr><th>E-posta</th><td>${escapeHtml(d.eposta || '-')}</td></tr>
                                     <tr><th>IP Adresi</th><td>${escapeHtml(d.ip || '-')}</td></tr>
+                                    <tr><th>Kaynak</th><td>${KAYNAK[d.kaynak] || escapeHtml(d.kaynak || '-')}</td></tr>
                                     <tr><th>Durum</th><td>${d.durum == 1 ? '<span class="badge text-bg-success">Aktif</span>' : '<span class="badge text-bg-secondary">Pasif</span>'}</td></tr>
                                 </tbody>
                             </table>
@@ -955,9 +1154,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <table class="table table-sm detay-tablo">
                                 <tbody>
                                     ${izinSatir('Aydınlatma Metni', d.aydinlatma)}
-                                    ${izinSatir('Açık Rıza', d.acik_riza)}
-                                    ${izinSatir('KVKK', d.kvkk)}
-                                    ${izinSatir('ETK', d.etk)}
+                                    ${izinSatir('Açık Rıza', d.acik_riza, d.verilen && d.verilen.acik_riza)}
+                                    ${izinSatir('KVKK', d.kvkk, d.verilen && d.verilen.kvkk)}
+                                    ${izinSatir('ETK', d.etk, d.verilen && d.verilen.etk)}
                                     ${izinSatir('GPS', d.gps)}
                                     <tr><th>Doğrulama</th><td><span class="badge text-bg-${escapeHtml(d.dogrulama_renk || 'secondary')}">${escapeHtml(d.dogrulama_adi || '-')}</span></td></tr>
                                     <tr><th>SMS Doğrulama</th><td>${escapeHtml(formatZaman(d.sms_tarih))}</td></tr>
@@ -965,6 +1164,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             </table>
                         </div>
                     </div>
+                    ${iptalHtml(d)}
                     ${kanitHtml(d)}
                     ${alanlar ? `<h6 class="mt-2 mb-2"><i class="bi bi-ui-checks me-1"></i>Form Alanları</h6>
                         <table class="table table-sm table-striped detay-tablo"><tbody>${alanlar}</tbody></table>` : ''}

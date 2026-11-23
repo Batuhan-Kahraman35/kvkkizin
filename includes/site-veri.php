@@ -67,6 +67,7 @@ $footerMenuler = [
         ['ad' => 'İzin Sistemi',     'link' => 'https://portal.ornek-kvkk.com/'],
         ['ad' => 'Envanter Sistemi', 'link' => 'https://portal.ornek-kvkk.com/'],
         ['ad' => 'Teklif Al',        'link' => '/#teklif-al'],
+        ['ad' => 'API Dokümantasyonu', 'link' => '/api-dokuman'],
     ],
     'GİZLİLİK &amp; KULLANIM ŞARTLARI' => [
         ['ad' => 'KVKK',              'link' => '/kvkk'],

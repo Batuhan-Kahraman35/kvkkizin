@@ -23,6 +23,7 @@ session_start();
 $servis = new FormBasvuru();
 $uniqid = (string)($_GET['u'] ?? '');
 $form = $servis->formGetir($uniqid);
+$otp = $form ? FormBasvuru::otpAyarlari($form['firma_id']) : null;
 $e = fn($s) => htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
 
 /* ======================================================================
@@ -80,7 +81,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 $_SESSION[$anahtar] = ['veri' => $veri, 'smslog_id' => $gonderim['smslog_id'], 'zaman' => time()];
                 $cevap(['success' => true, 'adim' => 'kod', 'telefon' => FormBasvuru::telefonMaskele($veri['baslik']['telefon']),
-                        'sure' => FormBasvuru::OTP_GECERLILIK_SN, 'tekrar' => FormBasvuru::OTP_TEKRAR_SN]);
+                        'sure' => $otp['gecerlilik_sn'], 'tekrar' => $otp['tekrar_sn']]);
 
             case 'dogrula':
                 $bek = $_SESSION[$anahtar] ?? null;
@@ -101,7 +102,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$bek) {
                     $cevap(['success' => false, 'bitti' => true, 'message' => 'Doğrulama oturumu bulunamadı. Lütfen formu tekrar gönderiniz.']);
                 }
-                $bekle = FormBasvuru::OTP_TEKRAR_SN - (time() - $bek['zaman']);
+                $bekle = $otp['tekrar_sn'] - (time() - $bek['zaman']);
                 if ($bekle > 0) {
                     $cevap(['success' => false, 'message' => "Yeni kod için $bekle saniye bekleyiniz."]);
                 }
@@ -112,7 +113,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION[$anahtar]['smslog_id'] = $gonderim['smslog_id'];
                 $_SESSION[$anahtar]['zaman'] = time();
                 $cevap(['success' => true, 'message' => 'Yeni doğrulama kodu gönderildi.',
-                        'sure' => FormBasvuru::OTP_GECERLILIK_SN, 'tekrar' => FormBasvuru::OTP_TEKRAR_SN]);
+                        'sure' => $otp['gecerlilik_sn'], 'tekrar' => $otp['tekrar_sn']]);
 
             default:
                 $cevap(['success' => false, 'message' => 'Geçersiz işlem.']);
@@ -307,8 +308,8 @@ $baslik = !$form ? 'Form bulunamadı'
             <div id="kodAdim" class="d-none text-center">
                 <i class="bi bi-chat-dots text-primary" style="font-size:2.6rem"></i>
                 <h5 class="mt-2">Doğrulama Kodu</h5>
-                <p class="text-muted"><b id="kodTelefon"></b> numarasına gönderilen <?= FormBasvuru::OTP_HANE ?> haneli kodu giriniz.</p>
-                <input type="text" class="form-control kod-giris mb-2" id="kodInput" inputmode="numeric" autocomplete="one-time-code" maxlength="<?= FormBasvuru::OTP_HANE ?>">
+                <p class="text-muted"><b id="kodTelefon"></b> numarasına gönderilen <?= (int)$otp['hane'] ?> haneli kodu giriniz.</p>
+                <input type="text" class="form-control kod-giris mb-2" id="kodInput" inputmode="numeric" autocomplete="one-time-code" maxlength="<?= (int)$otp['hane'] ?>">
                 <div class="small text-muted mb-3">Kalan süre: <span id="kodSure">--:--</span></div>
                 <div class="alert alert-danger d-none" id="kodHata"></div>
                 <button type="button" class="btn btn-primary w-100 py-2 mb-2" id="btnDogrula">
@@ -477,8 +478,8 @@ $baslik = !$form ? 'Form bulunamadı'
     // 2. adım: kod doğrula
     const dogrula = () => {
         const kod = $('#kodInput').val().replace(/\D/g, '');
-        if (kod.length !== <?= FormBasvuru::OTP_HANE ?>) {
-            $('#kodHata').text('Lütfen <?= FormBasvuru::OTP_HANE ?> haneli kodu giriniz.').removeClass('d-none');
+        if (kod.length !== <?= (int)$otp['hane'] ?>) {
+            $('#kodHata').text('Lütfen <?= (int)$otp['hane'] ?> haneli kodu giriniz.').removeClass('d-none');
             return;
         }
         const btn = $('#btnDogrula');
@@ -493,8 +494,8 @@ $baslik = !$form ? 'Form bulunamadı'
     };
     $('#btnDogrula').on('click', dogrula);
     $('#kodInput').on('input', function () {
-        this.value = this.value.replace(/\D/g, '').slice(0, <?= FormBasvuru::OTP_HANE ?>);
-        if (this.value.length === <?= FormBasvuru::OTP_HANE ?>) dogrula();
+        this.value = this.value.replace(/\D/g, '').slice(0, <?= (int)$otp['hane'] ?>);
+        if (this.value.length === <?= (int)$otp['hane'] ?>) dogrula();
     }).on('keydown', e => { if (e.key === 'Enter') dogrula(); });
 
     $('#btnTekrar').on('click', function () {

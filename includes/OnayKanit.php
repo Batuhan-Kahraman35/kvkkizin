@@ -47,7 +47,7 @@ class OnayKanit
                    form_basvuru_sms_referans,
                    CONVERT(VARCHAR(19), form_basvuru_sms_dogrulama_tarihi, 120) AS sms_dogrulama_tarihi,
                    form_basvuru_aydinlatma_onay, form_basvuru_acik_riza_onay, form_basvuru_kvkk_onay,
-                   form_basvuru_etk_onay, form_basvuru_gps_onay
+                   form_basvuru_etk_onay, form_basvuru_gps_onay, form_basvuru_api_anahtar_id
             FROM dbo.Form_Basvurulari
             WHERE form_basvuru_id = ?
         ", [(int)$basvuruId]);
@@ -102,6 +102,18 @@ class OnayKanit
                 'kabul'      => (int)$o['form_basvuru_onay_kabul'],
             ], $onaylar ?: []),
         ];
+
+        // API'den gelen kayıt: anahtar ve çağıran sunucunun IP'si de kanıta girer.
+        // Blok yalnız API kayıtlarında eklenir; web formu kayıtlarının kanıt JSON'u değişmez.
+        if ($b['form_basvuru_api_anahtar_id'] !== null) {
+            $bekleyen = $db->fetchOne("
+                SELECT bekleyen_cagiran_ip FROM dbo.Api_Bekleyen_Basvurular WHERE bekleyen_basvuru_id = ?
+            ", [(int)$basvuruId]);
+            $veri['api'] = [
+                'anahtar_id' => (int)$b['form_basvuru_api_anahtar_id'],
+                'cagiran_ip' => $s($bekleyen['bekleyen_cagiran_ip'] ?? null),
+            ];
+        }
 
         return json_encode($veri, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }

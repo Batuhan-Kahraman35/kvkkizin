@@ -38,6 +38,7 @@ $tekFirma = ($firmaScopeIds !== null && count($firmaScopeIds) <= 1);
 
 // Müşteri Listesi bağlantısı için İzinli Müşteriler yetkisi
 $musteriYetki = PageAuth::checkPagePermissions($user['kullanici_id'], $user['departman_id'], 'izinli-musteriler.php');
+$apiYetki = PageAuth::checkPagePermissions($user['kullanici_id'], $user['departman_id'], 'api-yonetimi.php');
 
 $siteAyarlari = $db->fetchOne("SELECT TOP 1 site_ayarlari_site_title FROM dbo.tanim_site_ayarlari ORDER BY site_ayarlari_id DESC");
 $siteTitle = $siteAyarlari['site_ayarlari_site_title'] ?? 'Portal';
@@ -687,6 +688,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             canAdd: <?= $permissions['can_add'] ? 'true' : 'false' ?>,
             musteriListesi: <?= !empty($musteriYetki['has_access']) ? 'true' : 'false' ?>
         };
+        const API_YONETIMI = <?= !empty($apiYetki['has_access']) ? 'true' : 'false' ?>;
 
         let dataTable, qrModal, yukleModal, kontrolModal;
         let currentfilters = {};
@@ -830,6 +832,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                              <li><a class="dropdown-item" href="#" onclick="sablonYukleAc(${f.form_id}); return false;"><i class="bi bi-upload me-2"></i>Şablon Yükle</a></li>`;
                 }
                 menu += `<li><a class="dropdown-item" href="#" onclick="kontrolAc(${f.form_id}); return false;"><i class="bi bi-search me-2"></i>Çoklu İzin Kontrol</a></li>`;
+                menu += `<li><hr class="dropdown-divider"></li>
+                         <li><a class="dropdown-item" href="#" onclick="apiBilgi(${f.form_id}); return false;"><i class="bi bi-plug me-2"></i>API ile Kullan</a></li>`;
 
                 const varsayilan = permissions.musteriListesi
                     ? `location.href='/Admin/izinli-musteriler?form_id=${f.form_id}'`
@@ -860,15 +864,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         /* ---------- Link / QR ---------- */
 
-        function linkKopyala(link) {
+        function linkKopyala(link, mesaj) {
+            mesaj = mesaj || 'Bağlantı kopyalandı';
             if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(link).then(() => showToast('Bağlantı kopyalandı', 'success'));
+                navigator.clipboard.writeText(link).then(() => showToast(mesaj, 'success'));
                 return;
             }
             const $gecici = $('<textarea>').val(link).appendTo('body').select();
             document.execCommand('copy');
             $gecici.remove();
-            showToast('Bağlantı kopyalandı', 'success');
+            showToast(mesaj, 'success');
+        }
+
+        /* ---------- API ile kullanım ---------- */
+
+        // Form kodunu (uniqid) ve bu formun API adreslerini gösterir
+        function apiBilgi(formId) {
+            const f = formlarById[formId];
+            if (!f) return;
+            const kok = location.origin + '/api';
+            const kod = String(f.form_uniqid);
+            const satir = (metot, yol) => `<tr><td><span class="badge text-bg-${metot === 'GET' ? 'success' : 'primary'}">${metot}</span></td>
+                <td class="font-monospace small text-break">${escapeHtml(yol)}</td></tr>`;
+            Swal.fire({
+                title: 'API ile Kullan',
+                width: 720,
+                html: `<div class="text-start">
+                    <p class="small text-muted mb-2"><b>${escapeHtml(f.form_adi)}</b> formuna kendi sitenizden veya yazılımınızdan izin göndermek için bu form kodunu kullanın.</p>
+                    <label class="form-label small fw-semibold mb-1">Form kodu (uniqid)</label>
+                    <div class="input-group mb-3">
+                        <input type="text" class="form-control font-monospace" value="${escapeHtml(kod)}" readonly>
+                        <button type="button" class="btn btn-outline-primary" onclick="linkKopyala('${escapeHtml(kod)}', 'Form kodu kopyalandı')"><i class="bi bi-clipboard"></i> Kopyala</button>
+                    </div>
+                    <table class="table table-sm mb-3"><tbody>
+                        ${satir('GET', kok + '/formlar/' + kod)}
+                        ${satir('POST', kok + '/formlar/' + kod + '/basvuru')}
+                        ${satir('GET', kok + '/formlar/' + kod + '/basvurular')}
+                    </tbody></table>
+                    <div class="small text-muted mb-3">İstekler <span class="font-monospace">Authorization: Bearer kvk_...</span> başlığıyla gönderilir.
+                        ${f.form_sms_onay == 1 ? 'Bu form SMS doğrulamalı: başvurudan sonra müşteriye giden kod <span class="font-monospace">POST /api/basvuru/dogrula</span> ile onaylanır.' : ''}</div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <a href="/api-dokuman" target="_blank" rel="noopener" class="btn btn-sm btn-primary"><i class="bi bi-book"></i> API Dokümantasyonu</a>
+                        ${API_YONETIMI ? '<a href="/admin/api-yonetimi" class="btn btn-sm btn-outline-secondary"><i class="bi bi-key"></i> Anahtar Oluştur</a>' : ''}
+                    </div>
+                </div>`,
+                showConfirmButton: false,
+                showCloseButton: true
+            });
         }
 
         function qrAc(formId) {
