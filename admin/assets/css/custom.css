@@ -245,3 +245,12 @@
 @media (prefers-color-scheme: dark) {
     /* Dark mode stilleri buraya eklenebilir */
 }
+/* ======================================
+   Modal perdesi: az hareket tercihi
+   AdminLTE, prefers-reduced-motion: reduce iken .fade öğelerine opacity:1 !important veriyor;
+   bu yüzden modal perdesi tamamen siyah görünüyordu. Animasyon kapalı kalır, yalnız saydamlık düzelir.
+   ====================================== */
+@media (prefers-reduced-motion: reduce) {
+    .modal-backdrop.fade.show { opacity: var(--bs-backdrop-opacity) !important; }
+    .modal-backdrop.fade:not(.show) { opacity: 0 !important; }
+}
