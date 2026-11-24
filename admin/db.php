@@ -223,16 +223,47 @@ class Database {
     }
     
     /**
+     * SQL metnindeki -- ve /* *\/ yorumlarını siler; '...' string ve [...] adların içine dokunmaz.
+     */
+    private static function yorumlariTemizle(string $sql): string {
+        $out = '';
+        $n = strlen($sql);
+        for ($i = 0; $i < $n; $i++) {
+            $c = $sql[$i];
+            $s = $sql[$i + 1] ?? '';
+            if ($c === "'" || $c === '[') {
+                $kapat = $c === "'" ? "'" : ']';
+                $j = $i + 1;
+                while ($j < $n) {
+                    if ($sql[$j] === $kapat) {
+                        if (($sql[$j + 1] ?? '') === $kapat) { $j += 2; continue; } // '' veya ]] kaçışı
+                        break;
+                    }
+                    $j++;
+                }
+                $out .= substr($sql, $i, $j - $i + 1);
+                $i = $j;
+            } elseif ($c === '-' && $s === '-') {
+                while ($i < $n && $sql[$i] !== "\n" && $sql[$i] !== "\r") $i++;
+                $i--;
+            } elseif ($c === '/' && $s === '*') {
+                $son = strpos($sql, '*/', $i + 2);
+                $i = $son === false ? $n : $son + 1;
+            } else {
+                $out .= $c;
+            }
+        }
+        return $out;
+    }
+
+    /**
      * Ham SQL çalıştır (GO komutuyla ayrılmış çoklu sorgular için)
      * @param string $sql SQL komutları
      * @return bool Başarı durumu
      */
     public function executeRaw($sql) {
-        // Önce çok satırlı yorumları temizle
-        $sql = preg_replace('/\/\*.*?\*\//s', '', $sql);
-        
-        // Tek satırlık yorumları temizle
-        $sql = preg_replace('/--[^\r\n]*/', '', $sql);
+        // Yorumları temizle (string ve [köşeli] adların içindeki -- ve /* */ korunur)
+        $sql = self::yorumlariTemizle($sql);
         
         // GO komutlarını ayır
         $batches = preg_split('/^\s*GO\s*$/im', $sql);
@@ -251,7 +282,11 @@ class Database {
                     continue;
                 }
                 
-                $stmt = sqlsrv_query($this->conn, $batch);
+                // Batch sp_executesql'e parametre olarak verilir: ODBC sürücüsü metni ayrıştırmaz,
+                // string içindeki ? (parametre işareti) ve { } (kaçış dizisi) hata üretmez
+                $stmt = sqlsrv_query($this->conn, 'EXEC sp_executesql ?', [
+                    [$batch, SQLSRV_PARAM_IN, SQLSRV_PHPTYPE_STRING('UTF-8'), SQLSRV_SQLTYPE_NVARCHAR('max')]
+                ]);
                 
                 if ($stmt === false) {
                     // Yalnızca gerçek hataları al (uyarı/bilgi mesajlarını değil)
