@@ -50,6 +50,8 @@ $belgeErisimi = !empty($belgePermissions['has_access']);
 // Form Yönetimi sayfası erişimi (satır bazlı form butonu için)
 $formPermissions = PageAuth::checkPagePermissions($user['kullanici_id'], $user['departman_id'], 'form-yonetimi.php');
 $formErisimi = !empty($formPermissions['has_access']);
+$evrakPermissions = PageAuth::checkPagePermissions($user['kullanici_id'], $user['departman_id'], 'evrak-seti-hazirla.php');
+$evrakErisimi = !empty($evrakPermissions['can_add']);
 
 // SMS Hesapları sayfası erişimi (kredi hücresinin bağlantı olması için)
 $smsPermissions = PageAuth::checkPagePermissions($user['kullanici_id'], $user['departman_id'], 'sms-hesaplari.php');
@@ -1029,6 +1031,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             canViewBelge: <?= $belgeErisimi ? 'true' : 'false' ?>,
             canViewSms: <?= $smsErisimi ? 'true' : 'false' ?>,
             formErisimi: <?= $formErisimi ? 'true' : 'false' ?>,
+            evrakErisimi: <?= $evrakErisimi ? 'true' : 'false' ?>,
             belgeAdd: <?= !empty($belgePermissions['can_add']) ? 'true' : 'false' ?>,
             belgeEdit: <?= !empty($belgePermissions['can_edit']) ? 'true' : 'false' ?>,
             belgeDelete: <?= !empty($belgePermissions['can_delete']) ? 'true' : 'false' ?>
@@ -1245,6 +1248,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     islemler += `
                         <a class="btn btn-sm btn-info" href="/Admin/form-yonetimi?firma_id=${firma.firma_id}" title="Form Yönetimi">
                             <i class="bi bi-ui-checks"></i>
+                        </a>
+                    `;
+                }
+                if (permissions.evrakErisimi) {
+                    islemler += `
+                        <a class="btn btn-sm btn-secondary" href="/Admin/evrak-seti-hazirla?firma_id=${firma.firma_id}" title="Evrak Seti Hazırla">
+                            <i class="bi bi-files"></i>
                         </a>
                     `;
                 }

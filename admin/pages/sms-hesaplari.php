@@ -323,6 +323,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // Test SMS modalındaki hesap seçimi: kapsamdaki aktif hesaplar
                 $hesaplar = $db->fetchAll("
                     SELECT h.sms_hesap_id, h.sms_hesap_kullanici_adi, h.sms_hesap_gonderici,
+                           h.sms_hesap_kredi, CONVERT(VARCHAR(16), h.sms_hesap_kredi_tarihi, 120) as sms_hesap_kredi_tarihi,
                            f.firma_adi, o.sms_operator_adi
                     FROM SmsHesaplari h
                     INNER JOIN Firmalar f ON h.sms_hesap_firma_id = f.firma_id
@@ -347,14 +348,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
+                // Birden fazla alıcı: telefon[] dizisi (tekrarlar ayıklanır)
+                $hamTelefonlar = $_POST['telefon'] ?? [];
+                if (!is_array($hamTelefonlar)) {
+                    $hamTelefonlar = [$hamTelefonlar];
+                }
+                $telefonlar = [];
                 $telefonHata = null;
-                $telefon = telefonNormalizeEtGuvenli($_POST['telefon'] ?? '', $telefonHata);
-                if ($telefon === null) {
+                foreach ($hamTelefonlar as $ham) {
+                    if (trim((string)$ham) === '') {
+                        continue;
+                    }
+                    $tel = telefonNormalizeEtGuvenli($ham, $telefonHata);
+                    if ($tel === null) {
+                        break;
+                    }
+                    $telefonlar[$tel] = $tel;
+                }
+                if ($telefonHata || !$telefonlar) {
                     echo json_encode(['success' => false, 'message' => $telefonHata ?: 'Telefon numarası boş olamaz!']);
+                    break;
+                }
+                if (count($telefonlar) > 5) {
+                    echo json_encode(['success' => false, 'message' => 'En fazla 5 numaraya test SMS gönderilebilir!']);
                     break;
                 }
 
                 $mesaj = trim((string)($_POST['mesaj'] ?? ''));
+
+                // {kredi} değişkeni: gönderimden hemen önce operatörden canlı kredi sorgulanır
+                $krediBilgi = null;
+                if (mb_stripos($mesaj, '{kredi}', 0, 'UTF-8') !== false) {
+                    $krediSonuc = SmsApi::kredi($hesap);
+                    if ($krediSonuc['success'] && $krediSonuc['kredi'] !== null) {
+                        SmsApi::testKaydet($id, true, 'Bağlantı başarılı - Kredi: ' . $krediSonuc['kredi'], $krediSonuc['kredi']);
+                        $krediBilgi = $krediSonuc['kredi'];
+                    } else {
+                        $krediBilgi = $hesap['sms_hesap_kredi'] ?? null;
+                    }
+                    $krediMetin = $krediBilgi !== null ? number_format((float)$krediBilgi, 0, ',', '.') : 'bilinmiyor';
+                    $mesaj = str_ireplace('{kredi}', $krediMetin, $mesaj);
+                }
                 if ($mesaj === '') {
                     echo json_encode(['success' => false, 'message' => 'Mesaj boş olamaz!']);
                     break;
@@ -369,20 +403,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'smslog_amac'         => 'test',
                 ];
 
-                $sonuc = ($_POST['tip'] ?? '') === 'otp'
-                    ? SmsApi::otpGonder($hesap, $telefon, $mesaj, $logEk)
-                    : SmsApi::gonder($hesap, $telefon, $mesaj, 'Test', $logEk);
+                $otp = ($_POST['tip'] ?? '') === 'otp';
+                $sonuclar = [];
+                $basarili = 0;
+                foreach ($telefonlar as $telefon) {
+                    $sonuc = $otp
+                        ? SmsApi::otpGonder($hesap, $telefon, $mesaj, $logEk)
+                        : SmsApi::gonder($hesap, $telefon, $mesaj, 'Test', $logEk);
+                    if (!empty($sonuc['success'])) {
+                        $basarili++;
+                    }
+                    $sonuclar[] = [
+                        'telefon'  => $telefon,
+                        'success'  => !empty($sonuc['success']),
+                        'message'  => !empty($sonuc['success']) ? 'Gönderildi' : ($sonuc['message'] ?? 'Gönderim başarısız'),
+                        'http_kod' => $sonuc['http_kod'] ?? null,
+                        'log_id'   => $sonuc['log_id'] ?? null,
+                        'yanit'    => mb_substr((string)($sonuc['ham'] ?? ''), 0, 1000, 'UTF-8'),
+                    ];
+                }
 
+                $toplam = count($telefonlar);
                 // Hata durumunda başlığın operatördeki onay durumuna bakılır
-                $aciklama = empty($sonuc['success']) ? SmsApi::gondericiSorunu($hesap) : null;
+                $aciklama = $basarili < $toplam ? SmsApi::gondericiSorunu($hesap) : null;
 
                 echo json_encode([
-                    'success'  => !empty($sonuc['success']),
-                    'message'  => !empty($sonuc['success']) ? 'Test SMS gönderildi' : ($sonuc['message'] ?? 'Gönderim başarısız'),
+                    'success'  => $basarili === $toplam,
+                    'message'  => $basarili === $toplam
+                        ? "Test SMS gönderildi ($toplam numara)"
+                        : "$basarili / $toplam numaraya gönderildi",
                     'aciklama' => $aciklama,
-                    'http_kod' => $sonuc['http_kod'] ?? null,
-                    'log_id'   => $sonuc['log_id'] ?? null,
-                    'yanit'    => mb_substr((string)($sonuc['ham'] ?? ''), 0, 1000, 'UTF-8'),
+                    'kredi'    => $krediBilgi,
+                    'mesaj'    => $mesaj,
+                    'sonuclar' => $sonuclar,
                 ]);
                 break;
 
@@ -766,11 +819,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <div class="col-md-12">
                                 <label for="test_hesap_id" class="form-label">SMS Hesabı <span class="text-danger">*</span></label>
                                 <select class="form-select" id="test_hesap_id" name="sms_hesap_id" required style="width: 100%;"></select>
+                                <small class="text-muted" id="test_kredi_bilgi"></small>
                             </div>
                             <div class="col-md-7">
-                                <label for="test_telefon" class="form-label">Telefon <span class="text-danger">*</span></label>
-                                <input type="tel" class="form-control" id="test_telefon" name="telefon" required maxlength="20"
-                                       placeholder="05XX XXX XX XX" value="<?= htmlspecialchars((string)$kullaniciTelefon) ?>">
+                                <label for="test_telefon" class="form-label">Telefonlar <span class="text-danger">*</span></label>
+                                <select class="form-select" id="test_telefon" name="telefon[]" multiple required style="width: 100%;"></select>
+                                <small class="text-muted">Numarayı yazıp Enter'a basın, birden fazla eklenebilir</small>
                             </div>
                             <div class="col-md-5">
                                 <label for="test_tip" class="form-label">Gönderim Tipi</label>
@@ -783,6 +837,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <label for="test_mesaj" class="form-label">Mesaj <span class="text-danger">*</span></label>
                                 <textarea class="form-control" id="test_mesaj" name="mesaj" rows="4" maxlength="918" required></textarea>
                                 <small class="text-muted" id="test_mesaj_sayac">0 karakter · 1 SMS</small>
+                                <small class="text-muted d-block"><code>{kredi}</code> gönderim anında hesabın kalan kredisiyle değiştirilir</small>
                             </div>
                             <div class="col-md-12 d-none" id="test_sonuc"></div>
                         </div>
@@ -1117,7 +1172,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // ---- Test SMS ----
         let testSmsModal;
-        const testMesajVarsayilan = <?= json_encode('Bu bir test mesajıdır. ' . $siteTitle, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
+        const testMesajVarsayilan = <?= json_encode('Bu bir test mesajıdır. ' . $siteTitle . ' - Kalan kredi: {kredi}', JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
+        const testKullaniciTelefon = <?= json_encode((string)$kullaniciTelefon, JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP) ?>;
+        // Her açılışta listeye eklenen sabit test alıcısı
+        const TEST_SABIT_TELEFON = '905550000000';
+        const TEST_TEL_ANAHTAR = 'smsTestTelefonlar';
+        let testHesapKredi = {};
+
+        // Son kullanılan alıcılar tarayıcıda hatırlanır; ilk açılışta oturumdaki kullanıcının telefonu gelir
+        function testTelefonlariYukle() {
+            let liste = [];
+            try { liste = JSON.parse(localStorage.getItem(TEST_TEL_ANAHTAR) || '[]'); } catch (e) { liste = []; }
+            if (!Array.isArray(liste) || liste.length === 0) {
+                liste = testKullaniciTelefon ? [testKullaniciTelefon] : [];
+            }
+            // Sabit numara her zaman listede olur (aynı numaranın farklı yazımı tekrar eklenmez)
+            const rakam = t => String(t).replace(/\D/g, '').slice(-10);
+            if (!liste.some(t => rakam(t) === rakam(TEST_SABIT_TELEFON))) {
+                liste.push(TEST_SABIT_TELEFON);
+            }
+            const $t = $('#test_telefon').empty();
+            liste.forEach(tel => $t.append(new Option(tel, tel, true, true)));
+            $t.trigger('change');
+        }
+
+        function testTelefonlariKaydet() {
+            try { localStorage.setItem(TEST_TEL_ANAHTAR, JSON.stringify($('#test_telefon').val() || [])); } catch (e) {}
+        }
+
+        function testKrediGoster() {
+            const h = testHesapKredi[$('#test_hesap_id').val()];
+            $('#test_kredi_bilgi').html(h && h.kredi !== null && h.kredi !== undefined
+                ? `<i class="bi bi-coin"></i> Son bilinen kredi: <b>${Number(h.kredi).toLocaleString('tr-TR')}</b>${h.tarih ? ' (' + escapeHtml(h.tarih) + ')' : ''}`
+                : '<i class="bi bi-coin"></i> Kredi bilgisi yok');
+        }
 
         $(function() {
             testSmsModal = new bootstrap.Modal(document.getElementById('testSmsModal'));
@@ -1126,6 +1214,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 theme: 'bootstrap-5', width: '100%', placeholder: 'Seçiniz...',
                 dropdownParent: $('#testSmsModal')
             });
+
+            $('#test_telefon').select2({
+                theme: 'bootstrap-5', width: '100%', placeholder: '05XX XXX XX XX',
+                tags: true, tokenSeparators: [',', ';'], maximumSelectionLength: 5,
+                dropdownParent: $('#testSmsModal'),
+                language: { noResults: () => 'Numarayı yazıp Enter\'a basın' }
+            });
+
+            $('#test_hesap_id').on('change', testKrediGoster);
 
             $('#test_mesaj').on('input', mesajSayacGuncelle);
 
@@ -1151,6 +1248,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $('#test_mesaj').val(testMesajVarsayilan);
             }
             mesajSayacGuncelle();
+            testTelefonlariYukle();
 
             $.post('', { action: 'test_hesap_list' }, function(response) {
                 if (!response.success) {
@@ -1163,7 +1261,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 const $s = $('#test_hesap_id').empty();
+                testHesapKredi = {};
                 response.data.forEach(h => {
+                    testHesapKredi[h.sms_hesap_id] = { kredi: h.sms_hesap_kredi, tarih: h.sms_hesap_kredi_tarihi };
                     const etiket = `${h.firma_adi} - ${h.sms_operator_adi} - ${h.sms_hesap_kullanici_adi}` +
                         (h.sms_hesap_gonderici ? ` (${h.sms_hesap_gonderici})` : '');
                     $s.append(new Option(etiket, h.sms_hesap_id, false, false));
@@ -1172,6 +1272,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $s.val(String(seciliId));
                 }
                 $s.trigger('change.select2');
+                testKrediGoster();
                 testSmsModal.show();
             }, 'json');
         }
@@ -1180,6 +1281,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const $btn = $('#btnTestSmsGonder');
             const formData = $('#testSmsForm').serializeArray();
             formData.push({ name: 'action', value: 'test_sms' });
+
+            if (!($('#test_telefon').val() || []).length) {
+                showToast('En az bir telefon numarası girin', 'warning');
+                return;
+            }
+            testTelefonlariKaydet();
 
             $btn.prop('disabled', true).html('<span class="spinner-border spinner-border-sm"></span> Gönderiliyor...');
 
@@ -1190,10 +1297,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     const ikon = data.success ? 'bi-check-circle-fill' : 'bi-x-circle-fill';
                     let detay = '';
                     if (data.aciklama) detay += `<div class="mt-2 fw-semibold"><i class="bi bi-info-circle"></i> ${escapeHtml(data.aciklama)}</div>`;
-                    if (data.http_kod) detay += `<br><small>HTTP: ${escapeHtml(data.http_kod)}</small>`;
-                    if (data.log_id) detay += `<br><small>Log No: ${escapeHtml(data.log_id)}</small>`;
-                    if (data.yanit) detay += `<pre class="small mb-0 mt-2" style="white-space: pre-wrap; max-height: 150px;">${escapeHtml(data.yanit)}</pre>`;
-
+                    if (data.kredi !== null && data.kredi !== undefined) {
+                        detay += `<br><small>Gönderim öncesi kredi: ${Number(data.kredi).toLocaleString('tr-TR')}</small>`;
+                        const hid = $('#test_hesap_id').val();
+                        testHesapKredi[hid] = { kredi: data.kredi, tarih: 'şimdi' };
+                        testKrediGoster();
+                    }
+                    if (data.mesaj) detay += `<br><small>Giden metin: ${escapeHtml(data.mesaj)}</small>`;
+                    (data.sonuclar || []).forEach(s => {
+                        detay += `<hr class="my-2"><i class="bi ${s.success ? 'bi-check-circle text-success' : 'bi-x-circle text-danger'}"></i> ` +
+                            `<b>${escapeHtml(s.telefon)}</b> — ${escapeHtml(s.message)}` +
+                            (s.http_kod ? ` <small>· HTTP: ${escapeHtml(s.http_kod)}</small>` : '') +
+                            (s.log_id ? ` <small>· Log No: ${escapeHtml(s.log_id)}</small>` : '') +
+                            (s.yanit ? `<pre class="small mb-0 mt-1" style="white-space: pre-wrap; max-height: 100px;">${escapeHtml(s.yanit)}</pre>` : '');
+                    });
                     $('#test_sonuc').removeClass('d-none').html(
                         `<div class="alert alert-${sinif} mb-0"><i class="bi ${ikon}"></i> ${escapeHtml(data.message)}${detay}</div>`
                     );
